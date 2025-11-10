@@ -100,11 +100,20 @@ class TelegramNotifier:
 		last_update_id = 0
 		error_count = 0
 		print(f"[Telegram] Starting polling loop...")
+		
+		# First, delete webhook if exists (to avoid 409 conflict)
+		try:
+			delete_response = requests.get(f"{self.base_url}/deleteWebhook", timeout=5)
+			if delete_response.status_code == 200:
+				print("[Telegram] Webhook deleted (if existed)")
+		except:
+			pass
+		
 		while self.running:
 			try:
 				response = requests.get(
 					f"{self.base_url}/getUpdates",
-					params={"offset": last_update_id + 1, "timeout": 10},
+					params={"offset": last_update_id + 1, "timeout": 10, "allowed_updates": ["message"]},
 					timeout=15
 				)
 				if response.status_code == 200:
@@ -121,33 +130,55 @@ class TelegramNotifier:
 								
 								# Handle /start command
 								if text == "/start" or text.startswith("/start"):
-									welcome_msg = """🤖 **Trading Bot**
+									welcome_msg = """🤖 Trading Bot
 
 Доступные команды:
 /stats - Показать статистику торговли
 /reset_stats - Сбросить статистику
 
 Бот работает в режиме polling и готов к работе!"""
-									self.send_message(chat_id, welcome_msg)
+									self.send_message(chat_id, welcome_msg, parse_mode=None)
 									# If chat_id was not set, save it from first message
 									if not self.chat_id:
 										self.chat_id = chat_id
 										self.notifications_enabled = bool(self.bot_token and self.chat_id)
 										if self.notifications_enabled:
 											print(f"✅ Chat ID saved from /start command: {chat_id}")
-											self.send_message(chat_id, "✅ Уведомления активированы!")
+											self.send_message(chat_id, "✅ Уведомления активированы!", parse_mode=None)
 								elif text == "/stats":
 									self._send_stats(chat_id)
 								elif text == "/reset_stats":
 									self.stats.reset()
-									self.send_message(chat_id, "📊 Статистика сброшена")
+									self.send_message(chat_id, "📊 Статистика сброшена", parse_mode=None)
 					else:
 						# Check for errors in response
 						if not data.get("ok"):
 							error_desc = data.get("description", "Unknown error")
 							print(f"[Telegram] ⚠️ API error: {error_desc}")
+				elif response.status_code == 409:
+					# Conflict - webhook exists or another process is polling
+					print(f"[Telegram] ⚠️ HTTP 409: Conflict detected. Trying to delete webhook...")
+					try:
+						delete_response = requests.get(f"{self.base_url}/deleteWebhook", timeout=5)
+						if delete_response.status_code == 200:
+							print("[Telegram] ✅ Webhook deleted, retrying...")
+							time.sleep(2)
+							continue
+					except Exception as e:
+						print(f"[Telegram] ⚠️ Failed to delete webhook: {e}")
+					error_count += 1
+					if error_count > 5:
+						print(f"[Telegram] ❌ Too many 409 errors, stopping polling")
+						break
 				else:
 					print(f"[Telegram] ⚠️ HTTP error: {response.status_code}")
+					if response.status_code == 200:
+						try:
+							error_data = response.json()
+							if not error_data.get("ok"):
+								print(f"[Telegram] ⚠️ API error: {error_data.get('description', 'Unknown')}")
+						except:
+							pass
 					error_count += 1
 					if error_count > 10:
 						print(f"[Telegram] ❌ Too many errors, stopping polling")
@@ -170,7 +201,7 @@ class TelegramNotifier:
 	def _send_stats(self, chat_id: str):
 		"""Send statistics to chat"""
 		stats = self.stats.get_stats()
-		message = f"""📊 **Статистика торговли**
+		message = f"""📊 Статистика торговли
 
 ✅ Вин: {stats['wins']}
 ❌ Лосов: {stats['losses']}
@@ -178,9 +209,9 @@ class TelegramNotifier:
 📈 Всего сделок: {stats['total_trades']}
 📊 Винрейт: {stats['win_rate']:.2f}%
 """
-		self.send_message(chat_id, message)
+		self.send_message(chat_id, message, parse_mode=None)
 	
-	def send_message(self, chat_id: str, message: str, parse_mode: str = "Markdown"):
+	def send_message(self, chat_id: str, message: str, parse_mode: Optional[str] = None):
 		"""Send message to Telegram chat"""
 		if not self.enabled or not self.base_url:
 			return
@@ -189,17 +220,26 @@ class TelegramNotifier:
 			return
 		
 		try:
+			payload = {
+				"chat_id": chat_id,
+				"text": message
+			}
+			# Only add parse_mode if specified (to avoid Markdown parsing errors)
+			if parse_mode:
+				payload["parse_mode"] = parse_mode
+			
 			response = requests.post(
 				f"{self.base_url}/sendMessage",
-				json={
-					"chat_id": chat_id,
-					"text": message,
-					"parse_mode": parse_mode
-				},
+				json=payload,
 				timeout=5
 			)
 			if response.status_code != 200:
-				print(f"⚠️ Failed to send Telegram message: {response.text}")
+				try:
+					error_data = response.json()
+					error_desc = error_data.get("description", response.text)
+					print(f"⚠️ Failed to send Telegram message: {error_desc}")
+				except:
+					print(f"⚠️ Failed to send Telegram message: {response.status_code} - {response.text}")
 		except Exception as e:
 			print(f"⚠️ Error sending Telegram message: {e}")
 	
@@ -208,7 +248,7 @@ class TelegramNotifier:
 		"""Notify about opened position"""
 		if not self.notifications_enabled:
 			return
-		message = f"""🚀 **Позиция открыта**
+		message = f"""🚀 Позиция открыта
 
 📊 Пара: {symbol}
 📈 Направление: {direction}
@@ -219,7 +259,7 @@ class TelegramNotifier:
 🏷️ Зона: {zone_id}
 ⏰ {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
 """
-		self.send_message(self.chat_id, message)
+		self.send_message(self.chat_id, message, parse_mode=None)
 	
 	def notify_position_closed(self, symbol: str, direction: str, entry_price: float,
 	                          exit_price: float, quantity: float, pnl: float, 
@@ -239,7 +279,7 @@ class TelegramNotifier:
 		emoji = "✅" if is_win else "❌"
 		trailing_emoji = "🎯" if by_trailing else ""
 		
-		message = f"""{emoji} **Позиция закрыта** {trailing_emoji}
+		message = f"""{emoji} Позиция закрыта {trailing_emoji}
 
 📊 Пара: {symbol}
 📈 Направление: {direction}
@@ -254,14 +294,14 @@ class TelegramNotifier:
 			message += f"📝 Причина: {reason}\n"
 		message += f"⏰ {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
 		
-		self.send_message(self.chat_id, message)
+		self.send_message(self.chat_id, message, parse_mode=None)
 	
 	def notify_trailing_activated(self, symbol: str, direction: str, entry_price: float,
 	                              current_price: float, stop_price: float, rr_ratio: float):
 		"""Notify about trailing stop activation"""
 		if not self.notifications_enabled:
 			return
-		message = f"""🎯 **Трейлинг стоп активирован**
+		message = f"""🎯 Трейлинг стоп активирован
 
 📊 Пара: {symbol}
 📈 Направление: {direction}
@@ -271,7 +311,7 @@ class TelegramNotifier:
 📈 RR: {rr_ratio:.2f}
 ⏰ {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
 """
-		self.send_message(self.chat_id, message)
+		self.send_message(self.chat_id, message, parse_mode=None)
 	
 	def stop(self):
 		"""Stop the bot"""
