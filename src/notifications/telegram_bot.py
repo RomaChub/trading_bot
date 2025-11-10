@@ -63,14 +63,24 @@ class TelegramNotifier:
 	def __init__(self, bot_token: Optional[str] = None, chat_id: Optional[str] = None):
 		self.bot_token = bot_token or os.getenv("TELEGRAM_BOT_TOKEN")
 		self.chat_id = chat_id or os.getenv("TELEGRAM_CHAT_ID")
-		self.base_url = f"https://api.telegram.org/bot{self.bot_token}"
+		self.base_url = f"https://api.telegram.org/bot{self.bot_token}" if self.bot_token else None
 		self.stats = TradeStats()
-		self.enabled = bool(self.bot_token and self.chat_id)
+		# Bot is enabled if we have bot_token (for commands)
+		self.enabled = bool(self.bot_token)
+		# Notifications are enabled only if we have both bot_token and chat_id
+		self.notifications_enabled = bool(self.bot_token and self.chat_id)
 		
 		if not self.enabled:
-			print("⚠️ Telegram notifications disabled: BOT_TOKEN or CHAT_ID not set")
+			print("⚠️ Telegram bot disabled: BOT_TOKEN not set")
+		elif not self.notifications_enabled:
+			print("✅ Telegram bot enabled (commands only)")
+			print("⚠️ Telegram notifications disabled: CHAT_ID not set")
+			# Start bot polling in background thread for commands
+			self.polling_thread = None
+			self.running = False
+			self.start_polling()
 		else:
-			print("✅ Telegram notifications enabled")
+			print("✅ Telegram bot enabled (commands + notifications)")
 			# Start bot polling in background thread
 			self.polling_thread = None
 			self.running = False
@@ -130,7 +140,10 @@ class TelegramNotifier:
 	
 	def send_message(self, chat_id: str, message: str, parse_mode: str = "Markdown"):
 		"""Send message to Telegram chat"""
-		if not self.enabled:
+		if not self.enabled or not self.base_url:
+			return
+		
+		if not chat_id:
 			return
 		
 		try:
@@ -151,6 +164,8 @@ class TelegramNotifier:
 	def notify_position_opened(self, symbol: str, direction: str, entry_price: float, 
 	                          quantity: float, stop_loss: float, take_profit: float, zone_id: int):
 		"""Notify about opened position"""
+		if not self.notifications_enabled:
+			return
 		message = f"""🚀 **Позиция открыта**
 
 📊 Пара: {symbol}
@@ -168,12 +183,16 @@ class TelegramNotifier:
 	                          exit_price: float, quantity: float, pnl: float, 
 	                          by_trailing: bool = False, reason: str = ""):
 		"""Notify about closed position"""
-		# Determine if win or loss
+		# Always update stats (even if notifications are disabled)
 		is_win = pnl > 0
 		if is_win:
 			self.stats.add_win(by_trailing=by_trailing)
 		else:
 			self.stats.add_loss()
+		
+		# Send notification only if enabled
+		if not self.notifications_enabled:
+			return
 		
 		emoji = "✅" if is_win else "❌"
 		trailing_emoji = "🎯" if by_trailing else ""
@@ -198,6 +217,8 @@ class TelegramNotifier:
 	def notify_trailing_activated(self, symbol: str, direction: str, entry_price: float,
 	                              current_price: float, stop_price: float, rr_ratio: float):
 		"""Notify about trailing stop activation"""
+		if not self.notifications_enabled:
+			return
 		message = f"""🎯 **Трейлинг стоп активирован**
 
 📊 Пара: {symbol}

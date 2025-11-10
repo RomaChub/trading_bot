@@ -17,9 +17,12 @@ if [ -z "$BINANCE_API_KEY" ] || [ -z "$BINANCE_API_SECRET" ]; then
     echo "⚠️  Warning: BINANCE_API_KEY or BINANCE_API_SECRET not set"
 fi
 
-if [ -z "$TELEGRAM_BOT_TOKEN" ] || [ -z "$TELEGRAM_CHAT_ID" ]; then
-    echo "⚠️  Warning: TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID not set"
-    echo "   Telegram notifications will be disabled"
+if [ -z "$TELEGRAM_BOT_TOKEN" ]; then
+    echo "⚠️  Warning: TELEGRAM_BOT_TOKEN not set"
+    echo "   Telegram bot will be disabled"
+elif [ -z "$TELEGRAM_CHAT_ID" ]; then
+    echo "⚠️  Warning: TELEGRAM_CHAT_ID not set"
+    echo "   Telegram bot will work for commands only (no notifications)"
 fi
 
 # Set default values for optional variables
