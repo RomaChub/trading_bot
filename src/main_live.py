@@ -4,6 +4,7 @@ import warnings
 import threading
 import os
 from datetime import datetime, timedelta
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 import pytz
 import pandas as pd
 from requests.exceptions import ConnectionError
@@ -38,21 +39,62 @@ def manage_trailing_stop(exec_client, symbol, interval, update_interval, directi
 	
 	trailing_active = False
 	last_step_applied = 0
+	last_log_time = 0  # For periodic logging
 	
 	print(f"[Trailing] Started for {direction} position. Activation threshold: ${trail_threshold:.2f}")
+	print(f"[Trailing] Entry: ${entry_price:.2f}, Initial stop: ${initial_stop:.2f}, Risk: ${risk:.2f}")
+	
+	# Используем ThreadPoolExecutor для неблокирующих API вызовов в трейлинг стопе
+	trailing_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix=f"{symbol}_trailing")
 	
 	while True:
 		try:
-			# Check if position still exists
-			positions = exec_client.get_open_positions(symbol)
-			has_position = any(abs(float(p.get("positionAmt", 0))) > 0 for p in positions)
+			# Check if position still exists (неблокирующий вызов)
+			def _get_positions_trailing():
+				try:
+					return exec_client.get_open_positions(symbol)
+				except Exception as e:
+					print(f"[Trailing] ⚠️ Error getting positions: {e}")
+					return []
+			
+			positions_future = trailing_executor.submit(_get_positions_trailing)
+			try:
+				positions = positions_future.result(timeout=5)
+				has_position = any(abs(float(p.get("positionAmt", 0))) > 0 for p in positions)
+			except FutureTimeoutError:
+				print("[Trailing] ⚠️ Timeout getting positions, assuming position still exists")
+				has_position = True  # Предполагаем что позиция еще есть
+			
 			if not has_position:
-				print("[Trailing] Position closed. Stopping trailing stop management.")
+				print("[Trailing] Position closed. Cleaning up conditional orders...")
+				# Cancel all conditional orders (stop loss and take profit) when position closes (неблокирующий)
+				def _cleanup_trailing():
+					try:
+						exec_client.cancel_all_conditional_orders(symbol)
+					except Exception as e:
+						print(f"[Trailing] ⚠️ Error cancelling orders: {e}")
+				
+				cleanup_future = trailing_executor.submit(_cleanup_trailing)
+				# Не ждем завершения - просто запускаем
+				print("[Trailing] Stopping trailing stop management.")
 				break
 			
-			# Fetch latest candles
-			kl = exec_client.fetch_recent_klines(symbol, interval, limit=2)
-			if not kl:
+			# Fetch latest candles (неблокирующий вызов)
+			def _get_klines_trailing():
+				try:
+					return exec_client.fetch_recent_klines(symbol, interval, limit=2)
+				except Exception as e:
+					print(f"[Trailing] ⚠️ Error fetching klines: {e}")
+					return None
+			
+			klines_future = trailing_executor.submit(_get_klines_trailing)
+			try:
+				kl = klines_future.result(timeout=5)
+				if not kl:
+					time.sleep(update_interval)
+					continue
+			except FutureTimeoutError:
+				print("[Trailing] ⚠️ Timeout fetching klines, skipping this iteration")
 				time.sleep(update_interval)
 				continue
 			
@@ -62,23 +104,38 @@ def manage_trailing_stop(exec_client, symbol, interval, update_interval, directi
 			
 			# Activate trailing only after reaching RR threshold
 			if not trailing_active:
+				# Log progress towards activation (every 30 seconds)
+				now = time.time()
+				if now - last_log_time > 30:
+					if direction == "LONG":
+						progress_pct = ((high - entry_price) / (trail_threshold - entry_price) * 100) if trail_threshold > entry_price else 0
+						print(f"[Trailing] Waiting for activation: High=${high:.2f}, Threshold=${trail_threshold:.2f}, Progress={progress_pct:.1f}%")
+					else:  # SHORT
+						progress_pct = ((entry_price - low) / (entry_price - trail_threshold) * 100) if entry_price > trail_threshold else 0
+						print(f"[Trailing] Waiting for activation: Low=${low:.2f}, Threshold=${trail_threshold:.2f}, Progress={progress_pct:.1f}%")
+					last_log_time = now
+				
 				if direction == "LONG" and high >= trail_threshold:
 					trailing_active = True
 					current_price = float(last[4])  # close price
 					print(f"[Trailing] ✅ Activated! Price reached ${high:.2f} (threshold: ${trail_threshold:.2f}, RR: {trail_rr:.2f})")
-					# Notify Telegram about trailing activation
-					if telegram_notifier:
-						telegram_notifier.notify_trailing_activated(
-							symbol=symbol,
-							direction=direction,
-							entry_price=entry_price,
-							current_price=current_price,
-							stop_price=current_stop,
-							rr_ratio=trail_rr
-						)
-					# Update trailing status
+					# Update trailing status FIRST (before Telegram notification)
 					if trailing_status_dict is not None:
 						trailing_status_dict[symbol] = True
+					# Notify Telegram about trailing activation (non-blocking, with error handling)
+					if telegram_notifier:
+						try:
+							telegram_notifier.notify_trailing_activated(
+								symbol=symbol,
+								direction=direction,
+								entry_price=entry_price,
+								current_price=current_price,
+								stop_price=current_stop,
+								rr_ratio=trail_rr
+							)
+						except Exception as e:
+							print(f"[Trailing] ⚠️ Failed to send Telegram notification: {e}")
+							# Continue execution - don't let Telegram errors stop trailing
 					# Initialize last_step_applied when trailing activates (for step mode)
 					if trail_mode == "step" and trail_step_pct > 0:
 						step_amount = entry_price * (trail_step_pct / 100.0)
@@ -89,19 +146,23 @@ def manage_trailing_stop(exec_client, symbol, interval, update_interval, directi
 					trailing_active = True
 					current_price = float(last[4])  # close price
 					print(f"[Trailing] ✅ Activated! Price reached ${low:.2f} (threshold: ${trail_threshold:.2f}, RR: {trail_rr:.2f})")
-					# Notify Telegram about trailing activation
-					if telegram_notifier:
-						telegram_notifier.notify_trailing_activated(
-							symbol=symbol,
-							direction=direction,
-							entry_price=entry_price,
-							current_price=current_price,
-							stop_price=current_stop,
-							rr_ratio=trail_rr
-						)
-					# Update trailing status
+					# Update trailing status FIRST (before Telegram notification)
 					if trailing_status_dict is not None:
 						trailing_status_dict[symbol] = True
+					# Notify Telegram about trailing activation (non-blocking, with error handling)
+					if telegram_notifier:
+						try:
+							telegram_notifier.notify_trailing_activated(
+								symbol=symbol,
+								direction=direction,
+								entry_price=entry_price,
+								current_price=current_price,
+								stop_price=current_stop,
+								rr_ratio=trail_rr
+							)
+						except Exception as e:
+							print(f"[Trailing] ⚠️ Failed to send Telegram notification: {e}")
+							# Continue execution - don't let Telegram errors stop trailing
 					# Initialize last_step_applied when trailing activates (for step mode)
 					if trail_mode == "step" and trail_step_pct > 0:
 						step_amount = entry_price * (trail_step_pct / 100.0)
@@ -112,6 +173,11 @@ def manage_trailing_stop(exec_client, symbol, interval, update_interval, directi
 			# Update trailing stop ONLY if trailing is active (after RR threshold reached)
 			new_stop = current_stop
 			if trailing_active:
+				# Log that trailing is active and we're checking for updates (every 60 seconds)
+				now = time.time()
+				if now - last_log_time > 60:
+					print(f"[Trailing] Active and monitoring for stop updates (Current: ${current_stop:.2f}, Price: ${float(last[4]):.2f})")
+					last_log_time = now
 				if trail_mode == "bar_extremes":
 					if direction == "LONG":
 						# For LONG: stop should be below the low, with optional buffer
@@ -172,14 +238,28 @@ def manage_trailing_stop(exec_client, symbol, interval, update_interval, directi
 					# Get current price for validation
 					current_market_price = float(last[4])  # close price from last candle
 					print(f"[Trailing] Updating stop: ${old_stop:.2f} -> ${current_stop:.2f} (change: ${stop_change:.2f})")
-					resp = exec_client.replace_stop_loss(
-						symbol, side=sl_side, quantity=position_qty, 
-						new_stop=current_stop, current_price=current_market_price
-					)
-					if dry_run:
-						print(f"[Trailing] ✅ DRY RUN: Stop would be updated to ${current_stop:.2f}")
-					else:
-						print(f"[Trailing] ✅ Stop updated to ${current_stop:.2f} | Response: {resp}")
+					
+					# Неблокирующий вызов для обновления стопа
+					def _update_stop():
+						try:
+							return exec_client.replace_stop_loss(
+								symbol, side=sl_side, quantity=position_qty, 
+								new_stop=current_stop, current_price=current_market_price
+							)
+						except Exception as e:
+							raise e  # Пробрасываем исключение для обработки выше
+					
+					stop_future = trailing_executor.submit(_update_stop)
+					try:
+						resp = stop_future.result(timeout=10)  # Таймаут 10 секунд для обновления стопа
+						if dry_run:
+							print(f"[Trailing] ✅ DRY RUN: Stop would be updated to ${current_stop:.2f}")
+						else:
+							print(f"[Trailing] ✅ Stop updated to ${current_stop:.2f} | Response: {resp}")
+					except FutureTimeoutError:
+						print("[Trailing] ⚠️ Timeout updating stop, reverting to old stop")
+						current_stop = old_stop
+						continue
 				except ValueError as e:
 					# Stop too close to price - skip this update and revert
 					current_stop = old_stop
@@ -201,7 +281,10 @@ def manage_trailing_stop(exec_client, symbol, interval, update_interval, directi
 			print("[Trailing] Stopped by user")
 			break
 		except Exception as e:
-			print(f"[Trailing] ⚠️ Error: {e}")
+			print(f"[Trailing] ⚠️ Error in trailing stop loop: {e}")
+			import traceback
+			traceback.print_exc()
+			# Continue execution - don't stop trailing on errors
 			time.sleep(update_interval)
 
 
@@ -503,22 +586,64 @@ def trade_symbol(symbol: str, args, exec_client, total_balance, use_trailing, dr
 	trailing_status = {}  # Will be shared with manage_trailing_stop via closure
 	
 	# Real-time monitoring loop
+	# Используем ThreadPoolExecutor для неблокирующих API вызовов
+	executor = ThreadPoolExecutor(max_workers=3, thread_name_prefix=f"{symbol}_api")
+	
 	while True:
 		try:
 			current_time = datetime.now(pytz.UTC)
-			ticker = exec_client.client.futures_symbol_ticker(symbol=symbol)
-			current_price = float(ticker['price'])
 			
-			# Check if position was closed (cleanup stop/take profit orders and chart entry points)
-			positions = exec_client.get_open_positions(symbol)
-			has_position = any(abs(float(p.get("positionAmt", 0))) > 0 for p in positions)
+			# Неблокирующий вызов для получения цены
+			def _get_ticker():
+				try:
+					return exec_client.client.futures_symbol_ticker(symbol=symbol)
+				except Exception as e:
+					print(f"[{symbol}] ⚠️ Error getting ticker: {e}")
+					return None
+			
+			ticker_future = executor.submit(_get_ticker)
+			try:
+				ticker = ticker_future.result(timeout=5)  # Таймаут 5 секунд
+				if ticker is None:
+					time.sleep(args.update_interval)
+					continue
+				current_price = float(ticker['price'])
+			except FutureTimeoutError:
+				print(f"[{symbol}] ⚠️ Timeout getting ticker, skipping this iteration")
+				time.sleep(args.update_interval)
+				continue
+			
+			# Неблокирующий вызов для проверки позиций
+			def _get_positions():
+				try:
+					return exec_client.get_open_positions(symbol)
+				except Exception as e:
+					print(f"[{symbol}] ⚠️ Error getting positions: {e}")
+					return []
+			
+			positions_future = executor.submit(_get_positions)
+			try:
+				positions = positions_future.result(timeout=5)  # Таймаут 5 секунд
+				has_position = any(abs(float(p.get("positionAmt", 0))) > 0 for p in positions)
+			except FutureTimeoutError:
+				print(f"[{symbol}] ⚠️ Timeout getting positions, using last known state")
+				has_position = last_has_position  # Используем последнее известное состояние
 			if last_has_position and not has_position:
 				# Position was closed - cleanup and notify
 				print(f"[{symbol}] 🔄 Position closed. Cleaning up orders and chart...")
-				exec_client.cancel_all_conditional_orders(symbol)
+				
+				# Неблокирующая очистка ордеров
+				def _cleanup_orders():
+					try:
+						exec_client.cancel_all_conditional_orders(symbol)
+					except Exception as e:
+						print(f"[{symbol}] ⚠️ Error cancelling orders: {e}")
+				
+				cleanup_future = executor.submit(_cleanup_orders)
+				# Не ждем завершения - продолжаем работу
 				if live_chart:
 					live_chart.remove_entry_points()
-				print(f"[{symbol}] ✅ Cleanup completed")
+				print(f"[{symbol}] ✅ Cleanup initiated")
 				
 				# Notify Telegram about closed position
 				if telegram_notifier and last_position_info:
@@ -557,8 +682,22 @@ def trade_symbol(symbol: str, args, exec_client, total_balance, use_trailing, dr
 			last_has_position = has_position
 			
 			# Get recent candles to check for breakout BEFORE updating data and recalculating zones
-			kl = exec_client.fetch_recent_klines(symbol, args.interval, limit=20)
-			if not kl:
+			# Неблокирующий вызов для получения свечей
+			def _get_klines():
+				try:
+					return exec_client.fetch_recent_klines(symbol, args.interval, limit=20)
+				except Exception as e:
+					print(f"[{symbol}] ⚠️ Error fetching klines: {e}")
+					return None
+			
+			klines_future = executor.submit(_get_klines)
+			try:
+				kl = klines_future.result(timeout=10)  # Таймаут 10 секунд для свечей
+				if not kl:
+					time.sleep(args.update_interval)
+					continue
+			except FutureTimeoutError:
+				print(f"[{symbol}] ⚠️ Timeout fetching klines, skipping this iteration")
 				time.sleep(args.update_interval)
 				continue
 
@@ -692,82 +831,99 @@ def trade_symbol(symbol: str, args, exec_client, total_balance, use_trailing, dr
 								traded_zones.add(zone_id)
 								break
 							
-							# Open position
+							# Open position (неблокирующая операция)
 							print(f"[{symbol}] [DEBUG] Opening {direction} position: {position_qty} @ ${entry_price:.2f}")
+							
+							def _open_position_and_orders():
+								try:
+									open_resp = open_side(symbol, quantity=position_qty)
+									if dry_run:
+										print(f"[{symbol}] [DEBUG] DRY RUN: Position would be opened")
+									else:
+										print(f"[{symbol}] [DEBUG] Position opened response: {open_resp}")
+									
+									# Place stop loss and take profit
+									print(f"[{symbol}] [DEBUG] Placing stop loss: {sl_side} {position_qty} @ ${stop_loss:.2f}")
+									sl_resp = exec_client.place_stop_loss(symbol, side=sl_side, quantity=position_qty, stop_price=stop_loss)
+									if not dry_run:
+										print(f"[{symbol}] [DEBUG] Stop loss placed: {sl_resp}")
+									
+									print(f"[{symbol}] [DEBUG] Placing take profit: {tp_side} {position_qty} @ ${take_profit:.2f}")
+									tp_resp = exec_client.place_take_profit(symbol, side=tp_side, quantity=position_qty, tp_price=take_profit)
+									if not dry_run:
+										print(f"[{symbol}] [DEBUG] Take profit placed: {tp_resp}")
+									
+									print(f"[{symbol}] ✅ Position opened: {direction} {position_qty} @ ${entry_price:.2f}")
+									return True
+								except Exception as e:
+									print(f"[{symbol}] ❌ ERROR opening position: {e}")
+									import traceback
+									traceback.print_exc()
+									return False
+							
+							# Запускаем в отдельном потоке, но ждем результат (с таймаутом)
+							position_future = executor.submit(_open_position_and_orders)
 							try:
-								open_resp = open_side(symbol, quantity=position_qty)
-								if dry_run:
-									print(f"[{symbol}] [DEBUG] DRY RUN: Position would be opened")
-								else:
-									print(f"[{symbol}] [DEBUG] Position opened response: {open_resp}")
-								
-								# Place stop loss and take profit
-								print(f"[{symbol}] [DEBUG] Placing stop loss: {sl_side} {position_qty} @ ${stop_loss:.2f}")
-								sl_resp = exec_client.place_stop_loss(symbol, side=sl_side, quantity=position_qty, stop_price=stop_loss)
-								if not dry_run:
-									print(f"[{symbol}] [DEBUG] Stop loss placed: {sl_resp}")
-								
-								print(f"[{symbol}] [DEBUG] Placing take profit: {tp_side} {position_qty} @ ${take_profit:.2f}")
-								tp_resp = exec_client.place_take_profit(symbol, side=tp_side, quantity=position_qty, tp_price=take_profit)
-								if not dry_run:
-									print(f"[{symbol}] [DEBUG] Take profit placed: {tp_resp}")
-								
-								print(f"[{symbol}] ✅ Position opened: {direction} {position_qty} @ ${entry_price:.2f}")
-								
-								# Store position info for notifications
-								last_position_info = {
-									"direction": direction,
-									"entry_price": entry_price,
-									"quantity": position_qty
-								}
-								
-								# Notify Telegram about opened position
-								if telegram_notifier:
-									telegram_notifier.notify_position_opened(
-										symbol=symbol,
-										direction=direction,
+								success = position_future.result(timeout=15)  # Таймаут 15 секунд для открытия позиции
+								if not success:
+									print(f"[{symbol}] ⚠️ Position opening failed")
+									breakout_found = True
+									traded_zones.add(zone_id)
+									break
+							except FutureTimeoutError:
+								print(f"[{symbol}] ⚠️ Timeout opening position, but continuing...")
+								# Продолжаем - позиция может открыться в фоне
+							
+							# Store position info for notifications
+							last_position_info = {
+								"direction": direction,
+								"entry_price": entry_price,
+								"quantity": position_qty
+							}
+							
+							# Notify Telegram about opened position (уже неблокирующее)
+							if telegram_notifier:
+								telegram_notifier.notify_position_opened(
+									symbol=symbol,
+									direction=direction,
+									entry_price=entry_price,
+									quantity=position_qty,
+									stop_loss=stop_loss,
+									take_profit=take_profit,
+									zone_id=zone_id
+								)
+							
+							# Add entry point to live chart
+							if live_chart:
+								try:
+									entry_time = pd.Timestamp(candle_close_time) if isinstance(candle_close_time, (pd.Timestamp, datetime)) else datetime.now(pytz.UTC)
+									live_chart.add_entry_point(
+										entry_time=entry_time,
 										entry_price=entry_price,
-										quantity=position_qty,
+										direction=direction,
+										zone_id=zone_id,
 										stop_loss=stop_loss,
-										take_profit=take_profit,
-										zone_id=zone_id
+										take_profit=take_profit
 									)
-								
-								# Add entry point to live chart
-								if live_chart:
-									try:
-										entry_time = pd.Timestamp(candle_close_time) if isinstance(candle_close_time, (pd.Timestamp, datetime)) else datetime.now(pytz.UTC)
-										live_chart.add_entry_point(
-											entry_time=entry_time,
-											entry_price=entry_price,
-											direction=direction,
-											zone_id=zone_id,
-											stop_loss=stop_loss,
-											take_profit=take_profit
-										)
-										# Обновляем график после добавления точки входа, чтобы он не зависал
-										live_chart.update_data(df=loader.df, zones=zones, current_price=current_price)
-									except Exception as e:
-										print(f"[{symbol}] ⚠️ Failed to add entry point to chart: {e}")
-								
-								# Start trailing stop management in separate thread if enabled
-								if use_trailing:
-									trailing_thread = threading.Thread(
-										target=manage_trailing_stop,
-										args=(
-											exec_client, symbol, args.interval, args.update_interval,
-											direction, entry_price, stop_loss, take_profit, position_qty,
-											args.trailing_activate_rr, args.trailing_mode,
-											args.trailing_step_pct, args.trailing_buffer_pct, dry_run, telegram_notifier, trailing_status
-										),
-										daemon=True
-									)
-									trailing_thread.start()
-									print(f"[{symbol}] 🔄 Trailing stop management started for {direction} position")
-							except Exception as e:
-								print(f"[{symbol}] ❌ ERROR opening position: {e}")
-								import traceback
-								traceback.print_exc()
+									# Обновляем график после добавления точки входа, чтобы он не зависал
+									live_chart.update_data(df=loader.df, zones=zones, current_price=current_price)
+								except Exception as e:
+									print(f"[{symbol}] ⚠️ Failed to add entry point to chart: {e}")
+							
+							# Start trailing stop management in separate thread if enabled
+							if use_trailing:
+								trailing_thread = threading.Thread(
+									target=manage_trailing_stop,
+									args=(
+										exec_client, symbol, args.interval, args.update_interval,
+										direction, entry_price, stop_loss, take_profit, position_qty,
+										args.trailing_activate_rr, args.trailing_mode,
+										args.trailing_step_pct, args.trailing_buffer_pct, dry_run, telegram_notifier, trailing_status
+									),
+									daemon=True
+								)
+								trailing_thread.start()
+								print(f"[{symbol}] 🔄 Trailing stop management started for {direction} position")
 							
 							breakout_found = True
 							traded_zones.add(zone_id)
@@ -834,82 +990,99 @@ def trade_symbol(symbol: str, args, exec_client, total_balance, use_trailing, dr
 								traded_zones.add(zone_id)
 								break
 							
-							# Open position
+							# Open position (неблокирующая операция)
 							print(f"[{symbol}] [DEBUG] Opening {direction} position: {position_qty} @ ${entry_price:.2f}")
+							
+							def _open_position_and_orders_short():
+								try:
+									open_resp = open_side(symbol, quantity=position_qty)
+									if dry_run:
+										print(f"[{symbol}] [DEBUG] DRY RUN: Position would be opened")
+									else:
+										print(f"[{symbol}] [DEBUG] Position opened response: {open_resp}")
+									
+									# Place stop loss and take profit
+									print(f"[{symbol}] [DEBUG] Placing stop loss: {sl_side} {position_qty} @ ${stop_loss:.2f}")
+									sl_resp = exec_client.place_stop_loss(symbol, side=sl_side, quantity=position_qty, stop_price=stop_loss)
+									if not dry_run:
+										print(f"[{symbol}] [DEBUG] Stop loss placed: {sl_resp}")
+									
+									print(f"[{symbol}] [DEBUG] Placing take profit: {tp_side} {position_qty} @ ${take_profit:.2f}")
+									tp_resp = exec_client.place_take_profit(symbol, side=tp_side, quantity=position_qty, tp_price=take_profit)
+									if not dry_run:
+										print(f"[{symbol}] [DEBUG] Take profit placed: {tp_resp}")
+									
+									print(f"[{symbol}] ✅ Position opened: {direction} {position_qty} @ ${entry_price:.2f}")
+									return True
+								except Exception as e:
+									print(f"[{symbol}] ❌ ERROR opening position: {e}")
+									import traceback
+									traceback.print_exc()
+									return False
+							
+							# Запускаем в отдельном потоке, но ждем результат (с таймаутом)
+							position_future = executor.submit(_open_position_and_orders_short)
 							try:
-								open_resp = open_side(symbol, quantity=position_qty)
-								if dry_run:
-									print(f"[{symbol}] [DEBUG] DRY RUN: Position would be opened")
-								else:
-									print(f"[{symbol}] [DEBUG] Position opened response: {open_resp}")
-								
-								# Place stop loss and take profit
-								print(f"[{symbol}] [DEBUG] Placing stop loss: {sl_side} {position_qty} @ ${stop_loss:.2f}")
-								sl_resp = exec_client.place_stop_loss(symbol, side=sl_side, quantity=position_qty, stop_price=stop_loss)
-								if not dry_run:
-									print(f"[{symbol}] [DEBUG] Stop loss placed: {sl_resp}")
-								
-								print(f"[{symbol}] [DEBUG] Placing take profit: {tp_side} {position_qty} @ ${take_profit:.2f}")
-								tp_resp = exec_client.place_take_profit(symbol, side=tp_side, quantity=position_qty, tp_price=take_profit)
-								if not dry_run:
-									print(f"[{symbol}] [DEBUG] Take profit placed: {tp_resp}")
-								
-								print(f"[{symbol}] ✅ Position opened: {direction} {position_qty} @ ${entry_price:.2f}")
-								
-								# Store position info for notifications
-								last_position_info = {
-									"direction": direction,
-									"entry_price": entry_price,
-									"quantity": position_qty
-								}
-								
-								# Notify Telegram about opened position
-								if telegram_notifier:
-									telegram_notifier.notify_position_opened(
-										symbol=symbol,
-										direction=direction,
+								success = position_future.result(timeout=15)  # Таймаут 15 секунд для открытия позиции
+								if not success:
+									print(f"[{symbol}] ⚠️ Position opening failed")
+									breakout_found = True
+									traded_zones.add(zone_id)
+									break
+							except FutureTimeoutError:
+								print(f"[{symbol}] ⚠️ Timeout opening position, but continuing...")
+								# Продолжаем - позиция может открыться в фоне
+							
+							# Store position info for notifications
+							last_position_info = {
+								"direction": direction,
+								"entry_price": entry_price,
+								"quantity": position_qty
+							}
+							
+							# Notify Telegram about opened position (уже неблокирующее)
+							if telegram_notifier:
+								telegram_notifier.notify_position_opened(
+									symbol=symbol,
+									direction=direction,
+									entry_price=entry_price,
+									quantity=position_qty,
+									stop_loss=stop_loss,
+									take_profit=take_profit,
+									zone_id=zone_id
+								)
+							
+							# Add entry point to live chart
+							if live_chart:
+								try:
+									entry_time = pd.Timestamp(candle_close_time) if isinstance(candle_close_time, (pd.Timestamp, datetime)) else datetime.now(pytz.UTC)
+									live_chart.add_entry_point(
+										entry_time=entry_time,
 										entry_price=entry_price,
-										quantity=position_qty,
+										direction=direction,
+										zone_id=zone_id,
 										stop_loss=stop_loss,
-										take_profit=take_profit,
-										zone_id=zone_id
+										take_profit=take_profit
 									)
-								
-								# Add entry point to live chart
-								if live_chart:
-									try:
-										entry_time = pd.Timestamp(candle_close_time) if isinstance(candle_close_time, (pd.Timestamp, datetime)) else datetime.now(pytz.UTC)
-										live_chart.add_entry_point(
-											entry_time=entry_time,
-											entry_price=entry_price,
-											direction=direction,
-											zone_id=zone_id,
-											stop_loss=stop_loss,
-											take_profit=take_profit
-										)
-										# Обновляем график после добавления точки входа, чтобы он не зависал
-										live_chart.update_data(df=loader.df, zones=zones, current_price=current_price)
-									except Exception as e:
-										print(f"[{symbol}] ⚠️ Failed to add entry point to chart: {e}")
-								
-								# Start trailing stop management in separate thread if enabled
-								if use_trailing:
-									trailing_thread = threading.Thread(
-										target=manage_trailing_stop,
-										args=(
-											exec_client, symbol, args.interval, args.update_interval,
-											direction, entry_price, stop_loss, take_profit, position_qty,
-											args.trailing_activate_rr, args.trailing_mode,
-											args.trailing_step_pct, args.trailing_buffer_pct, dry_run, telegram_notifier, trailing_status
-										),
-										daemon=True
-									)
-									trailing_thread.start()
-									print(f"[{symbol}] 🔄 Trailing stop management started for {direction} position")
-							except Exception as e:
-								print(f"[{symbol}] ❌ ERROR opening position: {e}")
-								import traceback
-								traceback.print_exc()
+									# Обновляем график после добавления точки входа, чтобы он не зависал
+									live_chart.update_data(df=loader.df, zones=zones, current_price=current_price)
+								except Exception as e:
+									print(f"[{symbol}] ⚠️ Failed to add entry point to chart: {e}")
+							
+							# Start trailing stop management in separate thread if enabled
+							if use_trailing:
+								trailing_thread = threading.Thread(
+									target=manage_trailing_stop,
+									args=(
+										exec_client, symbol, args.interval, args.update_interval,
+										direction, entry_price, stop_loss, take_profit, position_qty,
+										args.trailing_activate_rr, args.trailing_mode,
+										args.trailing_step_pct, args.trailing_buffer_pct, dry_run, telegram_notifier, trailing_status
+									),
+									daemon=True
+								)
+								trailing_thread.start()
+								print(f"[{symbol}] 🔄 Trailing stop management started for {direction} position")
 							
 							breakout_found = True
 							traded_zones.add(zone_id)
@@ -1019,7 +1192,7 @@ def main():
 	parser.add_argument("--symbol", default=DEFAULT_SYMBOL, help="Single symbol to trade (deprecated, use --symbols)")
 	parser.add_argument("--symbols", default="BTCUSDT,ETHUSDT,BNBUSDT", help="Comma-separated list of symbols to trade (e.g., BTCUSDT,BNBUSDT,ETHUSDT). Default: BTCUSDT,ETHUSDT,BNBUSDT")
 	parser.add_argument("--interval", default=DEFAULT_INTERVAL)
-	parser.add_argument("--lookback_days", type=int, default=10, help="Days of historical data for zone detection (default: 7)")
+	parser.add_argument("--lookback_days", type=int, default=5, help="Days of historical data for zone detection (default: 7)")
 	parser.add_argument("--zone_max_age_hours", type=int, default=48, help="Maximum age of zones to monitor in hours (default: 48)")
 	parser.add_argument("--leverage", type=int, default=15, help="Fixed leverage (default: 15)")
 	parser.add_argument("--risk_per_trade", type=float, default=RISK_MANAGEMENT["risk_per_trade"])

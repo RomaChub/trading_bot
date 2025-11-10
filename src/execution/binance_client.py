@@ -404,18 +404,52 @@ class BinanceFuturesExecutor:
 		if self.dry_run:
 			print(f"[Cleanup] DRY RUN: Would cancel all conditional orders for {symbol}")
 			return
-		orders = self.get_open_orders(symbol)
-		cancelled = 0
-		for o in orders:
-			otype = o.get("type")
-			if otype in ("STOP", "STOP_MARKET", "TAKE_PROFIT", "TAKE_PROFIT_MARKET"):
-				try:
-					self.cancel_order(symbol, int(o.get("orderId")))
-					cancelled += 1
-				except Exception as e:
-					print(f"[Cleanup] ⚠️ Failed to cancel order {o.get('orderId')}: {e}")
-		if cancelled > 0:
-			print(f"[Cleanup] ✅ Cancelled {cancelled} conditional order(s) for {symbol}")
+		
+		try:
+			orders = self.get_open_orders(symbol)
+			if not orders:
+				print(f"[Cleanup] No open orders found for {symbol}")
+				return
+			
+			print(f"[Cleanup] Found {len(orders)} open order(s) for {symbol}")
+			cancelled = 0
+			failed = 0
+			
+			for o in orders:
+				otype = o.get("type", "")
+				order_id = o.get("orderId")
+				order_status = o.get("status", "")
+				
+				# Log all orders for debugging
+				print(f"[Cleanup] Order {order_id}: type={otype}, status={order_status}")
+				
+				# Cancel all conditional order types
+				# Include all possible conditional order types
+				if otype in ("STOP", "STOP_MARKET", "TAKE_PROFIT", "TAKE_PROFIT_MARKET", 
+				            "STOP_LOSS", "STOP_LOSS_LIMIT", "TAKE_PROFIT_LIMIT"):
+					try:
+						self.cancel_order(symbol, int(order_id))
+						cancelled += 1
+						print(f"[Cleanup] ✅ Cancelled {otype} order {order_id}")
+					except Exception as e:
+						failed += 1
+						# Check if order was already filled or cancelled
+						error_msg = str(e).lower()
+						if "does not exist" in error_msg or "not found" in error_msg or "already" in error_msg:
+							print(f"[Cleanup] Order {order_id} already cancelled/filled (OK)")
+						else:
+							print(f"[Cleanup] ⚠️ Failed to cancel order {order_id} ({otype}): {e}")
+			
+			if cancelled > 0:
+				print(f"[Cleanup] ✅ Successfully cancelled {cancelled} conditional order(s) for {symbol}")
+			elif failed > 0:
+				print(f"[Cleanup] ⚠️ Attempted to cancel {failed} order(s), but all were already cancelled/filled")
+			else:
+				print(f"[Cleanup] No conditional orders found to cancel for {symbol}")
+		except Exception as e:
+			print(f"[Cleanup] ❌ Error getting/cancelling orders for {symbol}: {e}")
+			import traceback
+			traceback.print_exc()
 
 	def replace_stop_loss(self, symbol: str, side: str, quantity: float, new_stop: float, current_price: float = None) -> Dict[str, Any]:
 		"""

@@ -212,36 +212,42 @@ class TelegramNotifier:
 		self.send_message(chat_id, message, parse_mode=None)
 	
 	def send_message(self, chat_id: str, message: str, parse_mode: Optional[str] = None):
-		"""Send message to Telegram chat"""
+		"""Send message to Telegram chat (non-blocking)"""
 		if not self.enabled or not self.base_url:
 			return
 		
 		if not chat_id:
 			return
 		
-		try:
-			payload = {
-				"chat_id": chat_id,
-				"text": message
-			}
-			# Only add parse_mode if specified (to avoid Markdown parsing errors)
-			if parse_mode:
-				payload["parse_mode"] = parse_mode
-			
-			response = requests.post(
-				f"{self.base_url}/sendMessage",
-				json=payload,
-				timeout=5
-			)
-			if response.status_code != 200:
-				try:
-					error_data = response.json()
-					error_desc = error_data.get("description", response.text)
-					print(f"⚠️ Failed to send Telegram message: {error_desc}")
-				except:
-					print(f"⚠️ Failed to send Telegram message: {response.status_code} - {response.text}")
-		except Exception as e:
-			print(f"⚠️ Error sending Telegram message: {e}")
+		# Отправляем в отдельном потоке, чтобы не блокировать основной код
+		def _send():
+			try:
+				payload = {
+					"chat_id": chat_id,
+					"text": message
+				}
+				# Only add parse_mode if specified (to avoid Markdown parsing errors)
+				if parse_mode:
+					payload["parse_mode"] = parse_mode
+				
+				response = requests.post(
+					f"{self.base_url}/sendMessage",
+					json=payload,
+					timeout=5
+				)
+				if response.status_code != 200:
+					try:
+						error_data = response.json()
+						error_desc = error_data.get("description", response.text)
+						print(f"⚠️ Failed to send Telegram message: {error_desc}")
+					except:
+						print(f"⚠️ Failed to send Telegram message: {response.status_code} - {response.text}")
+			except Exception as e:
+				print(f"⚠️ Error sending Telegram message: {e}")
+		
+		# Запускаем в отдельном потоке (daemon=True чтобы не блокировать завершение программы)
+		thread = threading.Thread(target=_send, daemon=True)
+		thread.start()
 	
 	def notify_position_opened(self, symbol: str, direction: str, entry_price: float, 
 	                          quantity: float, stop_loss: float, take_profit: float, zone_id: int):
