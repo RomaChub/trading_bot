@@ -1011,6 +1011,9 @@ def main():
 	show_live_chart = args.show_live_chart.lower() == "true"
 	exec_client = BinanceFuturesExecutor(dry_run=dry_run)
 	
+	# Initialize Telegram notifier
+	telegram_notifier = TelegramNotifier()
+	
 	# Determine symbols to trade
 	if args.symbols:
 		symbols = [s.strip().upper() for s in args.symbols.split(',')]
