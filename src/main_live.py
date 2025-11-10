@@ -571,7 +571,8 @@ def trade_symbol(symbol: str, args, exec_client, total_balance, use_trailing, dr
 			kl_df[['open', 'high', 'low', 'close', 'volume']] = kl_df[['open', 'high', 'low', 'close', 'volume']].astype(float)
 			
 			# Get the most recent closed candle's close price
-			closed_candles = kl_df[pd.to_datetime(kl_df['close_time'], unit='ms', utc=True) < current_time]
+			# Используем уже преобразованный close_time (не преобразуем снова)
+			closed_candles = kl_df[kl_df['close_time'] < current_time]
 			if not closed_candles.empty:
 				latest_closed_price = float(closed_candles.iloc[-1]['close'])
 				latest_closed_candle = closed_candles.iloc[-1]
@@ -580,35 +581,60 @@ def trade_symbol(symbol: str, args, exec_client, total_balance, use_trailing, dr
 				latest_closed_candle = None
 			
 			# ПЕРЕД обновлением данных и пересчетом зон: проверяем пробой только в САМОЙ НОВОЙ зоне
-			if active_zones and latest_closed_candle is not None:
-				# Находим самую новую зону (с самым поздним end)
-				newest_zone = max(active_zones, key=lambda z: _ensure_utc(z.get('end')))
-				active_zones = [newest_zone]  # Проверяем только самую новую зону
-				
-				breakout_found = False
-				for idx, zone in enumerate(active_zones):
-					zone_id = zone.get('zone_id', idx)
+			# ВАЖНО: Берем самую новую зону из ВСЕХ зон, а не только из активных
+			# Это нужно, чтобы отслеживать пробой даже если текущая цена уже вышла из зоны
+			if zones and latest_closed_candle is not None:
+				# Фильтруем зоны: исключаем уже торгованные и слишком старые
+				max_zone_age = timedelta(hours=args.zone_max_age_hours)
+				candidate_zones = []
+				for zone in zones:
+					zone_id = zone.get('zone_id', -1)
 					if zone_id in traded_zones:
 						continue
+					zone_end_dt = _ensure_utc(zone.get('end'))
+					if zone_end_dt >= current_time:
+						continue  # Зона еще не закончилась
+					if current_time - zone_end_dt > max_zone_age:
+						continue  # Зона слишком старая
+					candidate_zones.append(zone)
+				
+				if not candidate_zones:
+					# Нет подходящих зон для отслеживания пробоя
+					pass
+				else:
+					# Находим самую новую зону (с самым поздним end)
+					newest_zone = max(candidate_zones, key=lambda z: _ensure_utc(z.get('end')))
+					
+					breakout_found = False
+					zone = newest_zone
+					zone_id = zone.get('zone_id', -1)
 					
 					zone_high = float(zone['high'])
 					zone_low = float(zone['low'])
 					zone_end_dt = _ensure_utc(zone.get('end'))
 					zone_end_ts = pd.Timestamp(zone_end_dt)
 					
+					# Отладочное сообщение для отслеживания
+					print(f"[{symbol}] [DEBUG] Monitoring newest zone {zone_id} for breakout (ended: {zone_end_dt}, range: ${zone_low:.2f}-${zone_high:.2f})")
+					
 					# Проверяем последнюю закрытую свечу на пробой
 					candle_high = float(latest_closed_candle['high'])
 					candle_low = float(latest_closed_candle['low'])
 					candle_close = float(latest_closed_candle['close'])
-					candle_time = latest_closed_candle.name
+					candle_open_time = latest_closed_candle.name  # open_time свечи
+					candle_close_time = latest_closed_candle['close_time']  # close_time свечи
 					
-					# Проверяем, относится ли эта свеча к зоне (после окончания зоны или последняя свеча зоны)
-					if candle_time >= zone_end_ts:
+					# ВАЖНО: Проверяем, что свеча закрылась ПОСЛЕ окончания зоны
+					# Используем close_time свечи, а не open_time
+					if candle_close_time >= zone_end_ts:
 						# Проверяем пробой с закреплением
-						if candle_high > zone_high and candle_close > zone_high:
+						# Для LONG: часть свечи должна быть в зоне (low в зоне), а закрыться выше зоны
+						# Для SHORT: часть свечи должна быть в зоне (high в зоне), а закрыться ниже зоны
+						# LONG пробой: low свечи в зоне И close выше зоны
+						if zone_low <= candle_low <= zone_high and candle_close > zone_high:
 							# LONG пробой - открываем позицию
 							print(f"[{symbol}] 🚨 BREAKOUT DETECTED! Zone {zone_id} | LONG")
-							print(f"   Candle: {candle_time} | High=${candle_high:.2f} > Zone High=${zone_high:.2f}, Close=${candle_close:.2f} > Zone High=${zone_high:.2f}")
+							print(f"   Candle closed: {candle_close_time} | Low=${candle_low:.2f} in zone [${zone_low:.2f}-${zone_high:.2f}], Close=${candle_close:.2f} > Zone High=${zone_high:.2f}")
 							print(f"   Zone: ${zone_low:.2f} - ${zone_high:.2f} | Current: ${current_price:.2f}")
 							
 							# Проверяем, есть ли уже открытая позиция по этой паре
@@ -710,7 +736,7 @@ def trade_symbol(symbol: str, args, exec_client, total_balance, use_trailing, dr
 								# Add entry point to live chart
 								if live_chart:
 									try:
-										entry_time = pd.Timestamp(candle_time) if isinstance(candle_time, (pd.Timestamp, datetime)) else datetime.now(pytz.UTC)
+										entry_time = pd.Timestamp(candle_close_time) if isinstance(candle_close_time, (pd.Timestamp, datetime)) else datetime.now(pytz.UTC)
 										live_chart.add_entry_point(
 											entry_time=entry_time,
 											entry_price=entry_price,
@@ -719,6 +745,8 @@ def trade_symbol(symbol: str, args, exec_client, total_balance, use_trailing, dr
 											stop_loss=stop_loss,
 											take_profit=take_profit
 										)
+										# Обновляем график после добавления точки входа, чтобы он не зависал
+										live_chart.update_data(df=loader.df, zones=zones, current_price=current_price)
 									except Exception as e:
 										print(f"[{symbol}] ⚠️ Failed to add entry point to chart: {e}")
 								
@@ -744,10 +772,11 @@ def trade_symbol(symbol: str, args, exec_client, total_balance, use_trailing, dr
 							breakout_found = True
 							traded_zones.add(zone_id)
 							break
-						elif candle_low < zone_low and candle_close < zone_low:
+						# SHORT пробой: high свечи в зоне И close ниже зоны
+						elif zone_low <= candle_high <= zone_high and candle_close < zone_low:
 							# SHORT пробой - открываем позицию (аналогично LONG, но для SHORT)
 							print(f"[{symbol}] 🚨 BREAKOUT DETECTED! Zone {zone_id} | SHORT")
-							print(f"   Candle: {candle_time} | Low=${candle_low:.2f} < Zone Low=${zone_low:.2f}, Close=${candle_close:.2f} < Zone Low=${zone_low:.2f}")
+							print(f"   Candle closed: {candle_close_time} | High=${candle_high:.2f} in zone [${zone_low:.2f}-${zone_high:.2f}], Close=${candle_close:.2f} < Zone Low=${zone_low:.2f}")
 							print(f"   Zone: ${zone_low:.2f} - ${zone_high:.2f} | Current: ${current_price:.2f}")
 							
 							# Проверяем, есть ли уже открытая позиция по этой паре
@@ -849,7 +878,7 @@ def trade_symbol(symbol: str, args, exec_client, total_balance, use_trailing, dr
 								# Add entry point to live chart
 								if live_chart:
 									try:
-										entry_time = pd.Timestamp(candle_time) if isinstance(candle_time, (pd.Timestamp, datetime)) else datetime.now(pytz.UTC)
+										entry_time = pd.Timestamp(candle_close_time) if isinstance(candle_close_time, (pd.Timestamp, datetime)) else datetime.now(pytz.UTC)
 										live_chart.add_entry_point(
 											entry_time=entry_time,
 											entry_price=entry_price,
@@ -858,6 +887,8 @@ def trade_symbol(symbol: str, args, exec_client, total_balance, use_trailing, dr
 											stop_loss=stop_loss,
 											take_profit=take_profit
 										)
+										# Обновляем график после добавления точки входа, чтобы он не зависал
+										live_chart.update_data(df=loader.df, zones=zones, current_price=current_price)
 									except Exception as e:
 										print(f"[{symbol}] ⚠️ Failed to add entry point to chart: {e}")
 								
