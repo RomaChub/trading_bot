@@ -98,6 +98,8 @@ class TelegramNotifier:
 	def _poll_commands(self):
 		"""Poll for bot commands"""
 		last_update_id = 0
+		error_count = 0
+		print(f"[Telegram] Starting polling loop...")
 		while self.running:
 			try:
 				response = requests.get(
@@ -112,17 +114,57 @@ class TelegramNotifier:
 							last_update_id = update["update_id"]
 							if "message" in update:
 								message = update["message"]
-								text = message.get("text", "")
-								chat_id = message["chat"]["id"]
+								text = message.get("text", "").strip()
+								chat_id = str(message["chat"]["id"])
 								
-								if text == "/stats":
+								print(f"[Telegram] Received message: {text} from chat_id: {chat_id}")
+								
+								# Handle /start command
+								if text == "/start" or text.startswith("/start"):
+									welcome_msg = """🤖 **Trading Bot**
+
+Доступные команды:
+/stats - Показать статистику торговли
+/reset_stats - Сбросить статистику
+
+Бот работает в режиме polling и готов к работе!"""
+									self.send_message(chat_id, welcome_msg)
+									# If chat_id was not set, save it from first message
+									if not self.chat_id:
+										self.chat_id = chat_id
+										self.notifications_enabled = bool(self.bot_token and self.chat_id)
+										if self.notifications_enabled:
+											print(f"✅ Chat ID saved from /start command: {chat_id}")
+											self.send_message(chat_id, "✅ Уведомления активированы!")
+								elif text == "/stats":
 									self._send_stats(chat_id)
 								elif text == "/reset_stats":
 									self.stats.reset()
 									self.send_message(chat_id, "📊 Статистика сброшена")
+					else:
+						# Check for errors in response
+						if not data.get("ok"):
+							error_desc = data.get("description", "Unknown error")
+							print(f"[Telegram] ⚠️ API error: {error_desc}")
+				else:
+					print(f"[Telegram] ⚠️ HTTP error: {response.status_code}")
+					error_count += 1
+					if error_count > 10:
+						print(f"[Telegram] ❌ Too many errors, stopping polling")
+						break
+			except requests.exceptions.RequestException as e:
+				error_count += 1
+				if error_count % 10 == 0:  # Log every 10th error
+					print(f"[Telegram] ⚠️ Connection error (count: {error_count}): {e}")
+				if error_count > 50:
+					print(f"[Telegram] ❌ Too many connection errors, stopping polling")
+					break
 			except Exception as e:
-				# Silently handle errors, just retry
-				pass
+				error_count += 1
+				print(f"[Telegram] ⚠️ Unexpected error: {e}")
+				if error_count > 20:
+					print(f"[Telegram] ❌ Too many errors, stopping polling")
+					break
 			time.sleep(1)
 	
 	def _send_stats(self, chat_id: str):
