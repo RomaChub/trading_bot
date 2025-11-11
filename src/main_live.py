@@ -46,246 +46,307 @@ def manage_trailing_stop(exec_client, symbol, interval, update_interval, directi
 	
 	# Используем ThreadPoolExecutor для неблокирующих API вызовов в трейлинг стопе
 	trailing_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix=f"{symbol}_trailing")
+	executor_shutdown = False
 	
-	while True:
-		try:
-			# Check if position still exists (неблокирующий вызов)
-			def _get_positions_trailing():
-				try:
-					return exec_client.get_open_positions(symbol)
-				except Exception as e:
-					print(f"[Trailing] ⚠️ Error getting positions: {e}")
-					return []
-			
-			positions_future = trailing_executor.submit(_get_positions_trailing)
+	try:
+		while True:
 			try:
-				positions = positions_future.result(timeout=5)
-				has_position = any(abs(float(p.get("positionAmt", 0))) > 0 for p in positions)
-			except FutureTimeoutError:
-				print("[Trailing] ⚠️ Timeout getting positions, assuming position still exists")
-				has_position = True  # Предполагаем что позиция еще есть
-			
-			if not has_position:
-				print("[Trailing] Position closed. Cleaning up conditional orders...")
-				# Cancel all conditional orders (stop loss and take profit) when position closes (неблокирующий)
-				def _cleanup_trailing():
-					try:
-						exec_client.cancel_all_conditional_orders(symbol)
-					except Exception as e:
-						print(f"[Trailing] ⚠️ Error cancelling orders: {e}")
+				# Check if executor is still valid
+				if executor_shutdown:
+					print("[Trailing] ⚠️ Executor is shut down, stopping trailing stop management")
+					break
 				
-				cleanup_future = trailing_executor.submit(_cleanup_trailing)
-				# Не ждем завершения - просто запускаем
-				print("[Trailing] Stopping trailing stop management.")
-				break
-			
-			# Fetch latest candles (неблокирующий вызов)
-			def _get_klines_trailing():
+				# Check if position still exists (неблокирующий вызов)
+				def _get_positions_trailing():
+					try:
+						return exec_client.get_open_positions(symbol)
+					except Exception as e:
+						print(f"[Trailing] ⚠️ Error getting positions: {e}")
+						return []
+				
 				try:
-					return exec_client.fetch_recent_klines(symbol, interval, limit=2)
-				except Exception as e:
-					print(f"[Trailing] ⚠️ Error fetching klines: {e}")
-					return None
-			
-			klines_future = trailing_executor.submit(_get_klines_trailing)
-			try:
-				kl = klines_future.result(timeout=5)
-				if not kl:
+					positions_future = trailing_executor.submit(_get_positions_trailing)
+				except RuntimeError as e:
+					if "cannot schedule new futures after shutdown" in str(e) or "shutdown" in str(e).lower():
+						print("[Trailing] ⚠️ Executor was shut down, stopping trailing stop management")
+						executor_shutdown = True
+						break
+					raise
+				
+				try:
+					positions = positions_future.result(timeout=5)
+					has_position = any(abs(float(p.get("positionAmt", 0))) > 0 for p in positions)
+				except FutureTimeoutError:
+					print("[Trailing] ⚠️ Timeout getting positions, assuming position still exists")
+					has_position = True  # Предполагаем что позиция еще есть
+				
+				if not has_position:
+					print("[Trailing] Position closed. Cleaning up conditional orders...")
+					# Cancel all conditional orders (stop loss and take profit) when position closes (неблокирующий)
+					def _cleanup_trailing():
+						try:
+							exec_client.cancel_all_conditional_orders(symbol)
+						except Exception as e:
+							print(f"[Trailing] ⚠️ Error cancelling orders: {e}")
+					
+					try:
+						if not executor_shutdown:
+							cleanup_future = trailing_executor.submit(_cleanup_trailing)
+							# Не ждем завершения - просто запускаем
+					except RuntimeError as e:
+						if "cannot schedule new futures after shutdown" in str(e) or "shutdown" in str(e).lower():
+							print("[Trailing] ⚠️ Executor was shut down, skipping cleanup")
+						else:
+							print(f"[Trailing] ⚠️ Error submitting cleanup task: {e}")
+					print("[Trailing] Stopping trailing stop management.")
+					break
+				
+				# Fetch latest candles (неблокирующий вызов)
+				def _get_klines_trailing():
+					try:
+						return exec_client.fetch_recent_klines(symbol, interval, limit=2)
+					except Exception as e:
+						print(f"[Trailing] ⚠️ Error fetching klines: {e}")
+						return None
+				
+				try:
+					klines_future = trailing_executor.submit(_get_klines_trailing)
+				except RuntimeError as e:
+					if "cannot schedule new futures after shutdown" in str(e) or "shutdown" in str(e).lower():
+						print("[Trailing] ⚠️ Executor was shut down, stopping trailing stop management")
+						executor_shutdown = True
+						break
+					raise
+				
+				try:
+					kl = klines_future.result(timeout=5)
+					if not kl:
+						time.sleep(update_interval)
+						continue
+				except FutureTimeoutError:
+					print("[Trailing] ⚠️ Timeout fetching klines, skipping this iteration")
 					time.sleep(update_interval)
 					continue
-			except FutureTimeoutError:
-				print("[Trailing] ⚠️ Timeout fetching klines, skipping this iteration")
-				time.sleep(update_interval)
-				continue
-			
-			last = kl[-1]
-			high = float(last[2])
-			low = float(last[3])
-			
-			# Activate trailing only after reaching RR threshold
-			if not trailing_active:
-				# Log progress towards activation (every 30 seconds)
-				now = time.time()
-				if now - last_log_time > 30:
-					if direction == "LONG":
-						progress_pct = ((high - entry_price) / (trail_threshold - entry_price) * 100) if trail_threshold > entry_price else 0
-						print(f"[Trailing] Waiting for activation: High=${high:.2f}, Threshold=${trail_threshold:.2f}, Progress={progress_pct:.1f}%")
-					else:  # SHORT
-						progress_pct = ((entry_price - low) / (entry_price - trail_threshold) * 100) if entry_price > trail_threshold else 0
-						print(f"[Trailing] Waiting for activation: Low=${low:.2f}, Threshold=${trail_threshold:.2f}, Progress={progress_pct:.1f}%")
-					last_log_time = now
 				
-				if direction == "LONG" and high >= trail_threshold:
-					trailing_active = True
-					current_price = float(last[4])  # close price
-					print(f"[Trailing] ✅ Activated! Price reached ${high:.2f} (threshold: ${trail_threshold:.2f}, RR: {trail_rr:.2f})")
-					# Update trailing status FIRST (before Telegram notification)
-					if trailing_status_dict is not None:
-						trailing_status_dict[symbol] = True
-					# Notify Telegram about trailing activation (non-blocking, with error handling)
-					if telegram_notifier:
-						try:
-							telegram_notifier.notify_trailing_activated(
-								symbol=symbol,
-								direction=direction,
-								entry_price=entry_price,
-								current_price=current_price,
-								stop_price=current_stop,
-								rr_ratio=trail_rr
-							)
-						except Exception as e:
-							print(f"[Trailing] ⚠️ Failed to send Telegram notification: {e}")
-							# Continue execution - don't let Telegram errors stop trailing
-					# Initialize last_step_applied when trailing activates (for step mode)
-					if trail_mode == "step" and trail_step_pct > 0:
-						step_amount = entry_price * (trail_step_pct / 100.0)
-						progress = (high - entry_price) / step_amount
-						last_step_applied = int(progress) if progress > 0 else 0
-						print(f"[Trailing] Initialized step counter: {last_step_applied} steps from entry")
-				elif direction == "SHORT" and low <= trail_threshold:
-					trailing_active = True
-					current_price = float(last[4])  # close price
-					print(f"[Trailing] ✅ Activated! Price reached ${low:.2f} (threshold: ${trail_threshold:.2f}, RR: {trail_rr:.2f})")
-					# Update trailing status FIRST (before Telegram notification)
-					if trailing_status_dict is not None:
-						trailing_status_dict[symbol] = True
-					# Notify Telegram about trailing activation (non-blocking, with error handling)
-					if telegram_notifier:
-						try:
-							telegram_notifier.notify_trailing_activated(
-								symbol=symbol,
-								direction=direction,
-								entry_price=entry_price,
-								current_price=current_price,
-								stop_price=current_stop,
-								rr_ratio=trail_rr
-							)
-						except Exception as e:
-							print(f"[Trailing] ⚠️ Failed to send Telegram notification: {e}")
-							# Continue execution - don't let Telegram errors stop trailing
-					# Initialize last_step_applied when trailing activates (for step mode)
-					if trail_mode == "step" and trail_step_pct > 0:
-						step_amount = entry_price * (trail_step_pct / 100.0)
-						progress = (entry_price - low) / step_amount
-						last_step_applied = int(progress) if progress > 0 else 0
-						print(f"[Trailing] Initialized step counter: {last_step_applied} steps from entry")
-			
-			# Update trailing stop ONLY if trailing is active (after RR threshold reached)
-			new_stop = current_stop
-			if trailing_active:
-				# Log that trailing is active and we're checking for updates (every 60 seconds)
-				now = time.time()
-				if now - last_log_time > 60:
-					print(f"[Trailing] Active and monitoring for stop updates (Current: ${current_stop:.2f}, Price: ${float(last[4]):.2f})")
-					last_log_time = now
-				if trail_mode == "bar_extremes":
-					if direction == "LONG":
-						# For LONG: stop should be below the low, with optional buffer
-						buffer = low * trail_buffer_pct / 100.0 if trail_buffer_pct > 0 else 0
-						proposed_stop = low - buffer
-						# Only move stop up (higher is better for LONG)
-						new_stop = max(current_stop, proposed_stop)
-						print(f"[Trailing] LONG bar_extremes: Low=${low:.2f}, Buffer=${buffer:.2f}, Proposed=${proposed_stop:.2f}, Current=${current_stop:.2f}, New=${new_stop:.2f}")
-					else:  # SHORT
-						# For SHORT: stop should be above the high, with optional buffer
-						buffer = high * trail_buffer_pct / 100.0 if trail_buffer_pct > 0 else 0
-						proposed_stop = high + buffer
-						# Only move stop down (lower is better for SHORT)
-						new_stop = min(current_stop, proposed_stop)
-						print(f"[Trailing] SHORT bar_extremes: High=${high:.2f}, Buffer=${buffer:.2f}, Proposed=${proposed_stop:.2f}, Current=${current_stop:.2f}, New=${new_stop:.2f}")
-				elif trail_mode == "step" and trail_step_pct > 0:
-					step_amount = entry_price * (trail_step_pct / 100.0)
-					if direction == "LONG":
-						progress = (high - entry_price) / step_amount
-						steps = int(progress) if progress > 0 else 0
-						if steps > last_step_applied:
-							# For LONG: stop moves up from initial_stop, not from entry_price
-							target_stop = initial_stop + steps * step_amount
-							buffer = target_stop * trail_buffer_pct / 100.0 if trail_buffer_pct > 0 else 0
-							proposed_stop = target_stop - buffer
-							# Only move stop up (higher is better for LONG), but ensure it's below current price
+				last = kl[-1]
+				high = float(last[2])
+				low = float(last[3])
+				
+				# Activate trailing only after reaching RR threshold
+				if not trailing_active:
+					# Log progress towards activation (every 30 seconds)
+					now = time.time()
+					if now - last_log_time > 30:
+						if direction == "LONG":
+							progress_pct = ((high - entry_price) / (trail_threshold - entry_price) * 100) if trail_threshold > entry_price else 0
+							print(f"[Trailing] Waiting for activation: High=${high:.2f}, Threshold=${trail_threshold:.2f}, Progress={progress_pct:.1f}%")
+						else:  # SHORT
+							progress_pct = ((entry_price - low) / (entry_price - trail_threshold) * 100) if entry_price > trail_threshold else 0
+							print(f"[Trailing] Waiting for activation: Low=${low:.2f}, Threshold=${trail_threshold:.2f}, Progress={progress_pct:.1f}%")
+						last_log_time = now
+				
+					if direction == "LONG" and high >= trail_threshold:
+						trailing_active = True
+						current_price = float(last[4])  # close price
+						print(f"[Trailing] ✅ Activated! Price reached ${high:.2f} (threshold: ${trail_threshold:.2f}, RR: {trail_rr:.2f})")
+						# Update trailing status FIRST (before Telegram notification)
+						if trailing_status_dict is not None:
+							trailing_status_dict[symbol] = True
+						# Notify Telegram about trailing activation (non-blocking, with error handling)
+						if telegram_notifier:
+							try:
+								telegram_notifier.notify_trailing_activated(
+									symbol=symbol,
+									direction=direction,
+									entry_price=entry_price,
+									current_price=current_price,
+									stop_price=current_stop,
+									rr_ratio=trail_rr
+								)
+							except Exception as e:
+								print(f"[Trailing] ⚠️ Failed to send Telegram notification: {e}")
+								# Continue execution - don't let Telegram errors stop trailing
+						# Initialize last_step_applied when trailing activates (for step mode)
+						if trail_mode == "step" and trail_step_pct > 0:
+							step_amount = entry_price * (trail_step_pct / 100.0)
+							progress = (high - entry_price) / step_amount
+							last_step_applied = int(progress) if progress > 0 else 0
+							print(f"[Trailing] Initialized step counter: {last_step_applied} steps from entry")
+					elif direction == "SHORT" and low <= trail_threshold:
+						trailing_active = True
+						current_price = float(last[4])  # close price
+						print(f"[Trailing] ✅ Activated! Price reached ${low:.2f} (threshold: ${trail_threshold:.2f}, RR: {trail_rr:.2f})")
+						# Update trailing status FIRST (before Telegram notification)
+						if trailing_status_dict is not None:
+							trailing_status_dict[symbol] = True
+						# Notify Telegram about trailing activation (non-blocking, with error handling)
+						if telegram_notifier:
+							try:
+								telegram_notifier.notify_trailing_activated(
+									symbol=symbol,
+									direction=direction,
+									entry_price=entry_price,
+									current_price=current_price,
+									stop_price=current_stop,
+									rr_ratio=trail_rr
+								)
+							except Exception as e:
+								print(f"[Trailing] ⚠️ Failed to send Telegram notification: {e}")
+								# Continue execution - don't let Telegram errors stop trailing
+						# Initialize last_step_applied when trailing activates (for step mode)
+						if trail_mode == "step" and trail_step_pct > 0:
+							step_amount = entry_price * (trail_step_pct / 100.0)
+							progress = (entry_price - low) / step_amount
+							last_step_applied = int(progress) if progress > 0 else 0
+							print(f"[Trailing] Initialized step counter: {last_step_applied} steps from entry")
+				
+				# Update trailing stop ONLY if trailing is active (after RR threshold reached)
+				new_stop = current_stop
+				if trailing_active:
+					# Log that trailing is active and we're checking for updates (every 60 seconds)
+					now = time.time()
+					if now - last_log_time > 60:
+						print(f"[Trailing] Active and monitoring for stop updates (Current: ${current_stop:.2f}, Price: ${float(last[4]):.2f})")
+						last_log_time = now
+					if trail_mode == "bar_extremes":
+						if direction == "LONG":
+							# For LONG: stop should be below the low, with optional buffer
+							buffer = low * trail_buffer_pct / 100.0 if trail_buffer_pct > 0 else 0
+							proposed_stop = low - buffer
+							# Only move stop up (higher is better for LONG)
 							new_stop = max(current_stop, proposed_stop)
-							# Ensure stop is below current price (safety check)
-							current_market_price = float(last[4])  # close price
-							if new_stop >= current_market_price:
-								new_stop = current_market_price * 0.999  # Set stop slightly below current price
-							last_step_applied = steps
-							print(f"[Trailing] LONG step: Steps={steps}, Target=${target_stop:.2f}, Buffer=${buffer:.2f}, Proposed=${proposed_stop:.2f}, Current=${current_stop:.2f}, New=${new_stop:.2f}")
-					else:  # SHORT
-						progress = (entry_price - low) / step_amount
-						steps = int(progress) if progress > 0 else 0
-						if steps > last_step_applied:
-							# For SHORT: stop moves down from initial_stop, not from entry_price
-							target_stop = initial_stop - steps * step_amount
-							buffer = abs(target_stop) * trail_buffer_pct / 100.0 if trail_buffer_pct > 0 else 0
-							proposed_stop = target_stop + buffer
-							# Only move stop down (lower is better for SHORT), but ensure it's above current price
+							print(f"[Trailing] LONG bar_extremes: Low=${low:.2f}, Buffer=${buffer:.2f}, Proposed=${proposed_stop:.2f}, Current=${current_stop:.2f}, New=${new_stop:.2f}")
+						else:  # SHORT
+							# For SHORT: stop should be above the high, with optional buffer
+							buffer = high * trail_buffer_pct / 100.0 if trail_buffer_pct > 0 else 0
+							proposed_stop = high + buffer
+							# Only move stop down (lower is better for SHORT)
 							new_stop = min(current_stop, proposed_stop)
-							# Ensure stop is above current price (safety check)
-							current_market_price = float(last[4])  # close price
-							if new_stop <= current_market_price:
-								new_stop = current_market_price * 1.001  # Set stop slightly above current price
-							last_step_applied = steps
-							print(f"[Trailing] SHORT step: Steps={steps}, Target=${target_stop:.2f}, Buffer=${buffer:.2f}, Proposed=${proposed_stop:.2f}, Current=${current_stop:.2f}, New=${new_stop:.2f}")
-			
-			# Update stop loss if changed significantly
-			stop_change = abs(new_stop - current_stop)
-			if stop_change > 0.01:  # Only update if change is significant
-				old_stop = current_stop
-				current_stop = new_stop
-				sl_side = "SELL" if direction == "LONG" else "BUY"
-				try:
-					# Get current price for validation
-					current_market_price = float(last[4])  # close price from last candle
-					print(f"[Trailing] Updating stop: ${old_stop:.2f} -> ${current_stop:.2f} (change: ${stop_change:.2f})")
-					
-					# Неблокирующий вызов для обновления стопа
-					def _update_stop():
-						try:
-							return exec_client.replace_stop_loss(
-								symbol, side=sl_side, quantity=position_qty, 
-								new_stop=current_stop, current_price=current_market_price
-							)
-						except Exception as e:
-							raise e  # Пробрасываем исключение для обработки выше
-					
-					stop_future = trailing_executor.submit(_update_stop)
+							print(f"[Trailing] SHORT bar_extremes: High=${high:.2f}, Buffer=${buffer:.2f}, Proposed=${proposed_stop:.2f}, Current=${current_stop:.2f}, New=${new_stop:.2f}")
+					elif trail_mode == "step" and trail_step_pct > 0:
+						step_amount = entry_price * (trail_step_pct / 100.0)
+						if direction == "LONG":
+							progress = (high - entry_price) / step_amount
+							steps = int(progress) if progress > 0 else 0
+							if steps > last_step_applied:
+								# For LONG: stop moves up from initial_stop, not from entry_price
+								target_stop = initial_stop + steps * step_amount
+								buffer = target_stop * trail_buffer_pct / 100.0 if trail_buffer_pct > 0 else 0
+								proposed_stop = target_stop - buffer
+								# Only move stop up (higher is better for LONG), but ensure it's below current price
+								new_stop = max(current_stop, proposed_stop)
+								# Ensure stop is below current price (safety check)
+								current_market_price = float(last[4])  # close price
+								if new_stop >= current_market_price:
+									new_stop = current_market_price * 0.999  # Set stop slightly below current price
+								last_step_applied = steps
+								print(f"[Trailing] LONG step: Steps={steps}, Target=${target_stop:.2f}, Buffer=${buffer:.2f}, Proposed=${proposed_stop:.2f}, Current=${current_stop:.2f}, New=${new_stop:.2f}")
+						else:  # SHORT
+							progress = (entry_price - low) / step_amount
+							steps = int(progress) if progress > 0 else 0
+							if steps > last_step_applied:
+								# For SHORT: stop moves down from initial_stop, not from entry_price
+								target_stop = initial_stop - steps * step_amount
+								buffer = abs(target_stop) * trail_buffer_pct / 100.0 if trail_buffer_pct > 0 else 0
+								proposed_stop = target_stop + buffer
+								# Only move stop down (lower is better for SHORT), but ensure it's above current price
+								new_stop = min(current_stop, proposed_stop)
+								# Ensure stop is above current price (safety check)
+								current_market_price = float(last[4])  # close price
+								if new_stop <= current_market_price:
+									new_stop = current_market_price * 1.001  # Set stop slightly above current price
+								last_step_applied = steps
+								print(f"[Trailing] SHORT step: Steps={steps}, Target=${target_stop:.2f}, Buffer=${buffer:.2f}, Proposed=${proposed_stop:.2f}, Current=${current_stop:.2f}, New=${new_stop:.2f}")
+				
+				# Update stop loss if changed significantly
+				stop_change = abs(new_stop - current_stop)
+				if stop_change > 0.01:  # Only update if change is significant
+					old_stop = current_stop
+					current_stop = new_stop
+					sl_side = "SELL" if direction == "LONG" else "BUY"
 					try:
-						resp = stop_future.result(timeout=10)  # Таймаут 10 секунд для обновления стопа
-						if dry_run:
-							print(f"[Trailing] ✅ DRY RUN: Stop would be updated to ${current_stop:.2f}")
-						else:
-							print(f"[Trailing] ✅ Stop updated to ${current_stop:.2f} | Response: {resp}")
-					except FutureTimeoutError:
-						print("[Trailing] ⚠️ Timeout updating stop, reverting to old stop")
+						# Get current price for validation
+						current_market_price = float(last[4])  # close price from last candle
+						print(f"[Trailing] Updating stop: ${old_stop:.2f} -> ${current_stop:.2f} (change: ${stop_change:.2f})")
+						
+						# Неблокирующий вызов для обновления стопа
+						def _update_stop():
+							try:
+								return exec_client.replace_stop_loss(
+									symbol, side=sl_side, quantity=position_qty, 
+									new_stop=current_stop, current_price=current_market_price
+								)
+							except Exception as e:
+								raise e  # Пробрасываем исключение для обработки выше
+						
+						try:
+							stop_future = trailing_executor.submit(_update_stop)
+						except RuntimeError as e:
+							if "cannot schedule new futures after shutdown" in str(e) or "shutdown" in str(e).lower():
+								print("[Trailing] ⚠️ Executor was shut down, cannot update stop")
+								executor_shutdown = True
+								break
+							raise
+						
+						try:
+							resp = stop_future.result(timeout=10)  # Таймаут 10 секунд для обновления стопа
+							if dry_run:
+								print(f"[Trailing] ✅ DRY RUN: Stop would be updated to ${current_stop:.2f}")
+							else:
+								print(f"[Trailing] ✅ Stop updated to ${current_stop:.2f} | Response: {resp}")
+						except FutureTimeoutError:
+							print("[Trailing] ⚠️ Timeout updating stop, reverting to old stop")
+							current_stop = old_stop
+							continue
+					except ValueError as e:
+						# Stop too close to price - skip this update and revert
 						current_stop = old_stop
-						continue
-				except ValueError as e:
-					# Stop too close to price - skip this update and revert
-					current_stop = old_stop
-					print(f"[Trailing] ⚠️ Skipping stop update (too close): {e}")
-				except Exception as e:
-					# Revert on error
-					current_stop = old_stop
-					print(f"[Trailing] ⚠️ Error updating stop: {e}")
+						print(f"[Trailing] ⚠️ Skipping stop update (too close): {e}")
+					except Exception as e:
+						# Revert on error
+						current_stop = old_stop
+						print(f"[Trailing] ⚠️ Error updating stop: {e}")
+						import traceback
+						traceback.print_exc()
+				else:
+					# Log when trailing is active but no update needed
+					if trailing_active:
+						print(f"[Trailing] Active but no update needed. Current stop: ${current_stop:.2f}, Proposed: ${new_stop:.2f}, Change: ${stop_change:.4f}")
+				
+				time.sleep(update_interval)
+				
+			except KeyboardInterrupt:
+				print("[Trailing] Stopped by user")
+				break
+			except RuntimeError as e:
+				# Handle executor shutdown errors
+				if "cannot schedule new futures after shutdown" in str(e) or "shutdown" in str(e).lower():
+					print("[Trailing] ⚠️ Executor was shut down, stopping trailing stop management")
+					executor_shutdown = True
+					break
+				else:
+					print(f"[Trailing] ⚠️ Runtime error in trailing stop loop: {e}")
 					import traceback
 					traceback.print_exc()
-			else:
-				# Log when trailing is active but no update needed
-				if trailing_active:
-					print(f"[Trailing] Active but no update needed. Current stop: ${current_stop:.2f}, Proposed: ${new_stop:.2f}, Change: ${stop_change:.4f}")
-			
-			time.sleep(update_interval)
-			
-		except KeyboardInterrupt:
-			print("[Trailing] Stopped by user")
-			break
-		except Exception as e:
-			print(f"[Trailing] ⚠️ Error in trailing stop loop: {e}")
-			import traceback
-			traceback.print_exc()
-			# Continue execution - don't stop trailing on errors
-			time.sleep(update_interval)
+					time.sleep(update_interval)
+			except Exception as e:
+				print(f"[Trailing] ⚠️ Error in trailing stop loop: {e}")
+				import traceback
+				traceback.print_exc()
+				# Continue execution - don't stop trailing on errors
+				time.sleep(update_interval)
+	finally:
+		# Properly shutdown the executor
+		if not executor_shutdown:
+			print("[Trailing] Shutting down executor...")
+			trailing_executor.shutdown(wait=False)  # Don't wait to avoid blocking
+		else:
+			# If already shut down, just ensure cleanup
+			try:
+				trailing_executor.shutdown(wait=False)
+			except:
+				pass
+		print("[Trailing] Trailing stop management stopped")
 
 
 def _ensure_utc(dt: datetime) -> datetime:
