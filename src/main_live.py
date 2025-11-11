@@ -879,15 +879,49 @@ def trade_symbol(symbol: str, args, exec_client, total_balance, use_trailing, dr
 							required_margin = notional_value / fixed_leverage
 							current_available_margin = available_margin
 							if not dry_run:
-								current_available_margin = exec_client.get_available_margin(symbol)
-								available_margin = current_available_margin
+								# Неблокирующий вызов для получения маржина с таймаутом
+								def _get_margin():
+									try:
+										return exec_client.get_available_margin(symbol)
+									except Exception as e:
+										print(f"[{symbol}] ⚠️ Error getting margin: {e}")
+										return available_margin  # Используем последнее известное значение
+								
+								margin_future = executor.submit(_get_margin)
+								try:
+									current_available_margin = margin_future.result(timeout=5)  # Таймаут 5 секунд
+									available_margin = current_available_margin
+								except FutureTimeoutError:
+									print(f"[{symbol}] ⚠️ Timeout getting margin, using last known value: ${available_margin:.2f}")
+									current_available_margin = available_margin  # Используем последнее известное значение
 							if not dry_run and current_available_margin <= 0:
 								print(f"[{symbol}] ❌ ERROR: No available margin. Latest fetched value: ${current_available_margin:.2f}")
+								# Уведомление в Telegram (неблокирующее)
+								if telegram_notifier and telegram_notifier.chat_id:
+									try:
+										telegram_notifier.send_message(
+											telegram_notifier.chat_id,
+											f"⚠️ [{symbol}] Недостаточно маржина для открытия позиции\n"
+											f"Доступно: ${current_available_margin:.2f} USDT"
+										)
+									except Exception as e:
+										print(f"[{symbol}] ⚠️ Failed to send Telegram notification: {e}")
 								breakout_found = True
 								traded_zones.add(zone_id)
 								break
 							if not dry_run and required_margin > current_available_margin:
-								print(f"[{symbol}] ❌ ERROR: Insufficient margin. Required: ${required_margin:.2f}, Available: ${available_margin:.2f}")
+								print(f"[{symbol}] ❌ ERROR: Insufficient margin. Required: ${required_margin:.2f}, Available: ${current_available_margin:.2f}")
+								# Уведомление в Telegram (неблокирующее)
+								if telegram_notifier and telegram_notifier.chat_id:
+									try:
+										telegram_notifier.send_message(
+											telegram_notifier.chat_id,
+											f"⚠️ [{symbol}] Недостаточно маржина для открытия позиции\n"
+											f"Требуется: ${required_margin:.2f} USDT\n"
+											f"Доступно: ${current_available_margin:.2f} USDT"
+										)
+									except Exception as e:
+										print(f"[{symbol}] ⚠️ Failed to send Telegram notification: {e}")
 								breakout_found = True
 								traded_zones.add(zone_id)
 								break
@@ -1038,15 +1072,49 @@ def trade_symbol(symbol: str, args, exec_client, total_balance, use_trailing, dr
 							required_margin = notional_value / fixed_leverage
 							current_available_margin = available_margin
 							if not dry_run:
-								current_available_margin = exec_client.get_available_margin(symbol)
-								available_margin = current_available_margin
+								# Неблокирующий вызов для получения маржина с таймаутом
+								def _get_margin():
+									try:
+										return exec_client.get_available_margin(symbol)
+									except Exception as e:
+										print(f"[{symbol}] ⚠️ Error getting margin: {e}")
+										return available_margin  # Используем последнее известное значение
+								
+								margin_future = executor.submit(_get_margin)
+								try:
+									current_available_margin = margin_future.result(timeout=5)  # Таймаут 5 секунд
+									available_margin = current_available_margin
+								except FutureTimeoutError:
+									print(f"[{symbol}] ⚠️ Timeout getting margin, using last known value: ${available_margin:.2f}")
+									current_available_margin = available_margin  # Используем последнее известное значение
 							if not dry_run and current_available_margin <= 0:
 								print(f"[{symbol}] ❌ ERROR: No available margin. Latest fetched value: ${current_available_margin:.2f}")
+								# Уведомление в Telegram (неблокирующее)
+								if telegram_notifier and telegram_notifier.chat_id:
+									try:
+										telegram_notifier.send_message(
+											telegram_notifier.chat_id,
+											f"⚠️ [{symbol}] Недостаточно маржина для открытия позиции\n"
+											f"Доступно: ${current_available_margin:.2f} USDT"
+										)
+									except Exception as e:
+										print(f"[{symbol}] ⚠️ Failed to send Telegram notification: {e}")
 								breakout_found = True
 								traded_zones.add(zone_id)
 								break
 							if not dry_run and required_margin > current_available_margin:
-								print(f"[{symbol}] ❌ ERROR: Insufficient margin. Required: ${required_margin:.2f}, Available: ${available_margin:.2f}")
+								print(f"[{symbol}] ❌ ERROR: Insufficient margin. Required: ${required_margin:.2f}, Available: ${current_available_margin:.2f}")
+								# Уведомление в Telegram (неблокирующее)
+								if telegram_notifier and telegram_notifier.chat_id:
+									try:
+										telegram_notifier.send_message(
+											telegram_notifier.chat_id,
+											f"⚠️ [{symbol}] Недостаточно маржина для открытия позиции\n"
+											f"Требуется: ${required_margin:.2f} USDT\n"
+											f"Доступно: ${current_available_margin:.2f} USDT"
+										)
+									except Exception as e:
+										print(f"[{symbol}] ⚠️ Failed to send Telegram notification: {e}")
 								breakout_found = True
 								traded_zones.add(zone_id)
 								break
