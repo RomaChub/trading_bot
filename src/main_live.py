@@ -570,12 +570,28 @@ def trade_symbol(symbol: str, args, exec_client, total_balance, use_trailing, dr
 	if args.show_live_chart.lower() == "true" and chart_port is not None:
 		live_chart = LiveChart(symbol=symbol, update_interval=args.update_interval, port=chart_port)
 	
+	# Track position info for notifications (initialize early so it's available for existing positions)
+	last_position_info = None  # Store: {direction, entry_price, quantity, trailing_activated}
+	
 	# Check for existing positions
 	existing_positions = exec_client.get_open_positions(symbol)
 	if existing_positions:
 		print(f"[{symbol}] ⚠️ Found {len(existing_positions)} open position(s):")
 		for pos in existing_positions:
 			print(f"  - {pos['symbol']}: {pos['positionAmt']} @ ${pos['entryPrice']:.2f} (P&L: ${pos['unRealizedProfit']:.2f})")
+			# Initialize last_position_info for existing position
+			position_amt = float(pos.get('positionAmt', 0))
+			if abs(position_amt) > 0:
+				direction = "LONG" if position_amt > 0 else "SHORT"
+				entry_price = float(pos.get('entryPrice', 0))
+				quantity = abs(position_amt)
+				# Store position info for notifications when it closes
+				last_position_info = {
+					"direction": direction,
+					"entry_price": entry_price,
+					"quantity": quantity
+				}
+				print(f"[{symbol}] ✅ Initialized last_position_info for existing {direction} position: {quantity} @ ${entry_price:.2f}")
 	
 	# Get available margin
 	available_margin = exec_client.get_available_margin(symbol)
@@ -641,8 +657,6 @@ def trade_symbol(symbol: str, args, exec_client, total_balance, use_trailing, dr
 	# Track open positions for cleanup and notifications
 	initial_positions = exec_client.get_open_positions(symbol)
 	last_has_position = any(abs(float(p.get("positionAmt", 0))) > 0 for p in initial_positions)
-	# Track position info for notifications
-	last_position_info = None  # Store: {direction, entry_price, quantity, trailing_activated}
 	# Shared dict to track trailing activation status (key: symbol, value: bool)
 	trailing_status = {}  # Will be shared with manage_trailing_stop via closure
 	
@@ -706,19 +720,82 @@ def trade_symbol(symbol: str, args, exec_client, total_balance, use_trailing, dr
 					live_chart.remove_entry_points()
 				print(f"[{symbol}] ✅ Cleanup initiated")
 				
-				# Notify Telegram about closed position
-				if telegram_notifier and last_position_info:
-					# Calculate PnL based on entry and current price
-					entry_price = last_position_info.get("entry_price", 0)
-					quantity = last_position_info.get("quantity", 0)
-					exit_price = current_price
-					
-					# Calculate PnL
-					direction = last_position_info.get("direction", "LONG")
-					if direction == "LONG":
-						pnl = (exit_price - entry_price) * quantity
-					else:  # SHORT
-						pnl = (entry_price - exit_price) * quantity
+				# Notify Telegram about closed position - ALWAYS send notification
+				if telegram_notifier:
+					# Try to get position info from last_position_info first
+					if last_position_info:
+						entry_price = last_position_info.get("entry_price", 0)
+						quantity = last_position_info.get("quantity", 0)
+						direction = last_position_info.get("direction", "LONG")
+						exit_price = current_price
+						
+						# Calculate PnL
+						if direction == "LONG":
+							pnl = (exit_price - entry_price) * quantity
+						else:  # SHORT
+							pnl = (entry_price - exit_price) * quantity
+					else:
+						# If last_position_info is not available, try to get from recent trades
+						# or use default values
+						print(f"[{symbol}] ⚠️ last_position_info not available, trying to get from API...")
+						try:
+							# Try to get information from the last closed position
+							# Get recent account trades to find the closed position
+							def _get_recent_trades():
+								try:
+									if not dry_run:
+										# Get last 10 trades for this symbol
+										trades = exec_client.client.futures_account_trades(symbol=symbol, limit=10)
+										return trades
+									return []
+								except Exception as e:
+									print(f"[{symbol}] ⚠️ Error getting recent trades: {e}")
+									return []
+							
+							trades_future = executor.submit(_get_recent_trades)
+							try:
+								recent_trades = trades_future.result(timeout=5)
+								if recent_trades and len(recent_trades) > 0:
+									# Find the most recent trade that closed a position
+									# For simplicity, use the last trade
+									last_trade = recent_trades[-1]
+									entry_price = float(last_trade.get("price", 0))
+									quantity = abs(float(last_trade.get("qty", 0)))
+									# Determine direction from position side or trade side
+									side = last_trade.get("side", "BUY")
+									direction = "LONG" if side == "BUY" else "SHORT"
+									exit_price = current_price
+									
+									# Calculate PnL (approximate)
+									if direction == "LONG":
+										pnl = (exit_price - entry_price) * quantity
+									else:  # SHORT
+										pnl = (entry_price - exit_price) * quantity
+									
+									print(f"[{symbol}] ✅ Got position info from recent trades: {direction} {quantity} @ ${entry_price:.2f}")
+								else:
+									# Fallback: use current price and estimate
+									print(f"[{symbol}] ⚠️ No recent trades found, using current price as estimate")
+									entry_price = current_price
+									quantity = 0
+									direction = "LONG"
+									exit_price = current_price
+									pnl = 0
+							except FutureTimeoutError:
+								print(f"[{symbol}] ⚠️ Timeout getting recent trades, using current price as estimate")
+								entry_price = current_price
+								quantity = 0
+								direction = "LONG"
+								exit_price = current_price
+								pnl = 0
+						except Exception as e:
+							print(f"[{symbol}] ⚠️ Error getting position info: {e}")
+							# Fallback: use current price
+							entry_price = current_price
+							quantity = 0
+							direction = "LONG"
+							exit_price = current_price
+							pnl = 0
 					
 					# Determine if closed by trailing (if trailing was activated)
 					by_trailing = trailing_status.get(symbol, False)
@@ -729,16 +806,24 @@ def trade_symbol(symbol: str, args, exec_client, total_balance, use_trailing, dr
 					if symbol in trailing_status:
 						del trailing_status[symbol]
 					
-					telegram_notifier.notify_position_closed(
-						symbol=symbol,
-						direction=direction,
-						entry_price=entry_price,
-						exit_price=exit_price,
-						quantity=quantity,
-						pnl=pnl,
-						by_trailing=by_trailing,
-						reason=reason
-					)
+					# Always send notification (even if some info is missing)
+					try:
+						telegram_notifier.notify_position_closed(
+							symbol=symbol,
+							direction=direction,
+							entry_price=entry_price,
+							exit_price=exit_price,
+							quantity=quantity,
+							pnl=pnl,
+							by_trailing=by_trailing,
+							reason=reason
+						)
+						print(f"[{symbol}] ✅ Position close notification sent to Telegram")
+					except Exception as e:
+						print(f"[{symbol}] ⚠️ Failed to send position close notification: {e}")
+						import traceback
+						traceback.print_exc()
+					
 					last_position_info = None
 			last_has_position = has_position
 			
