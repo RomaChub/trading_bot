@@ -26,7 +26,7 @@ warnings.filterwarnings('ignore')
 
 def manage_trailing_stop(exec_client, symbol, interval, update_interval, direction, entry_price, 
                          initial_stop, take_profit, position_qty, trail_activate_rr, trail_mode,
-                         trail_step_pct, trail_buffer_pct, dry_run, telegram_notifier=None, trailing_status_dict=None):
+                         trail_step_pct, trail_buffer_pct, dry_run, telegram_notifier=None, trailing_status_dict=None, notification_sent_dict=None):
 	"""Manage trailing stop for an open position"""
 	current_stop = initial_stop
 	trail_rr = float(trail_activate_rr)
@@ -109,6 +109,72 @@ def manage_trailing_stop(exec_client, symbol, interval, update_interval, directi
 				
 				if not has_position:
 					print("[Trailing] Position closed. Cleaning up conditional orders...")
+					
+					# Get exit price and send notification before cleanup
+					exit_price = None
+					try:
+						# Get current price from ticker for accurate exit price
+						def _get_exit_price():
+							try:
+								ticker = exec_client.client.futures_symbol_ticker(symbol=symbol)
+								return float(ticker['price'])
+							except Exception as e:
+								print(f"[Trailing] ⚠️ Error getting exit price: {e}")
+								return None
+						
+						if _check_executor_alive():
+							exit_price_future = trailing_executor.submit(_get_exit_price)
+							try:
+								exit_price = exit_price_future.result(timeout=3)
+							except FutureTimeoutError:
+								print("[Trailing] ⚠️ Timeout getting exit price")
+						else:
+							# If executor is shut down, try direct call
+							try:
+								ticker = exec_client.client.futures_symbol_ticker(symbol=symbol)
+								exit_price = float(ticker['price'])
+							except Exception as e:
+								print(f"[Trailing] ⚠️ Error getting exit price directly: {e}")
+					except Exception as e:
+						print(f"[Trailing] ⚠️ Error getting exit price: {e}")
+					
+					# Fallback: use entry_price if we couldn't get exit price (shouldn't happen, but safety)
+					if exit_price is None:
+						print("[Trailing] ⚠️ Could not get exit price, using entry price as fallback")
+						exit_price = entry_price
+					
+					# Calculate PnL
+					if direction == "LONG":
+						pnl = (exit_price - entry_price) * position_qty
+					else:  # SHORT
+						pnl = (entry_price - exit_price) * position_qty
+					
+					# Check if trailing was activated
+					by_trailing = trailing_status_dict.get(symbol, False) if trailing_status_dict is not None else False
+					reason = "Trailing Stop" if by_trailing else ("Take Profit" if pnl > 0 else "Stop Loss")
+					
+					# Send Telegram notification about position closure
+					if telegram_notifier:
+						try:
+							telegram_notifier.notify_position_closed(
+								symbol=symbol,
+								direction=direction,
+								entry_price=entry_price,
+								exit_price=exit_price,
+								quantity=position_qty,
+								pnl=pnl,
+								by_trailing=by_trailing,
+								reason=reason
+							)
+							# Mark that notification was sent by trailing stop
+							if notification_sent_dict is not None:
+								notification_sent_dict[symbol] = True
+							print(f"[Trailing] ✅ Position close notification sent to Telegram (Exit: ${exit_price:.2f}, P&L: ${pnl:.2f})")
+						except Exception as e:
+							print(f"[Trailing] ⚠️ Failed to send position close notification: {e}")
+							import traceback
+							traceback.print_exc()
+					
 					# Cancel all conditional orders (stop loss and take profit) when position closes (неблокирующий)
 					def _cleanup_trailing():
 						try:
@@ -732,6 +798,8 @@ def trade_symbol(symbol: str, args, exec_client, total_balance, use_trailing, dr
 	last_has_position = any(abs(float(p.get("positionAmt", 0))) > 0 for p in initial_positions)
 	# Shared dict to track trailing activation status (key: symbol, value: bool)
 	trailing_status = {}  # Will be shared with manage_trailing_stop via closure
+	# Shared dict to track if notification was already sent by trailing stop (key: symbol, value: bool)
+	notification_sent_by_trailing = {}  # Will be shared with manage_trailing_stop via closure
 	
 	# Real-time monitoring loop
 	# Используем ThreadPoolExecutor для неблокирующих API вызовов
@@ -793,8 +861,11 @@ def trade_symbol(symbol: str, args, exec_client, total_balance, use_trailing, dr
 					live_chart.remove_entry_points()
 				print(f"[{symbol}] ✅ Cleanup initiated")
 				
-				# Notify Telegram about closed position - ALWAYS send notification
-				if telegram_notifier:
+				# Check if notification was already sent by trailing stop
+				already_notified = notification_sent_by_trailing.get(symbol, False)
+				
+				# Notify Telegram about closed position - only if trailing stop didn't already send it
+				if telegram_notifier and not already_notified:
 					# Try to get position info from last_position_info first
 					if last_position_info:
 						entry_price = last_position_info.get("entry_price", 0)
@@ -896,6 +967,10 @@ def trade_symbol(symbol: str, args, exec_client, total_balance, use_trailing, dr
 						print(f"[{symbol}] ⚠️ Failed to send position close notification: {e}")
 						import traceback
 						traceback.print_exc()
+					else:
+						# Clear the notification flag after sending
+						if symbol in notification_sent_by_trailing:
+							del notification_sent_by_trailing[symbol]
 					
 					last_position_info = None
 			last_has_position = has_position
@@ -1133,6 +1208,9 @@ def trade_symbol(symbol: str, args, exec_client, total_balance, use_trailing, dr
 								"entry_price": entry_price,
 								"quantity": position_qty
 							}
+							# Clear notification flag for new position
+							if symbol in notification_sent_by_trailing:
+								del notification_sent_by_trailing[symbol]
 							
 							# Notify Telegram about opened position (уже неблокирующее)
 							if telegram_notifier:
@@ -1171,7 +1249,7 @@ def trade_symbol(symbol: str, args, exec_client, total_balance, use_trailing, dr
 										exec_client, symbol, args.interval, args.update_interval,
 										direction, entry_price, stop_loss, take_profit, position_qty,
 										args.trailing_activate_rr, args.trailing_mode,
-										args.trailing_step_pct, args.trailing_buffer_pct, dry_run, telegram_notifier, trailing_status
+										args.trailing_step_pct, args.trailing_buffer_pct, dry_run, telegram_notifier, trailing_status, notification_sent_by_trailing
 									),
 									daemon=True
 								)
@@ -1326,6 +1404,9 @@ def trade_symbol(symbol: str, args, exec_client, total_balance, use_trailing, dr
 								"entry_price": entry_price,
 								"quantity": position_qty
 							}
+							# Clear notification flag for new position
+							if symbol in notification_sent_by_trailing:
+								del notification_sent_by_trailing[symbol]
 							
 							# Notify Telegram about opened position (уже неблокирующее)
 							if telegram_notifier:
@@ -1364,7 +1445,7 @@ def trade_symbol(symbol: str, args, exec_client, total_balance, use_trailing, dr
 										exec_client, symbol, args.interval, args.update_interval,
 										direction, entry_price, stop_loss, take_profit, position_qty,
 										args.trailing_activate_rr, args.trailing_mode,
-										args.trailing_step_pct, args.trailing_buffer_pct, dry_run, telegram_notifier, trailing_status
+										args.trailing_step_pct, args.trailing_buffer_pct, dry_run, telegram_notifier, trailing_status, notification_sent_by_trailing
 									),
 									daemon=True
 								)
