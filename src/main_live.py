@@ -48,11 +48,25 @@ def manage_trailing_stop(exec_client, symbol, interval, update_interval, directi
 	trailing_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix=f"{symbol}_trailing")
 	executor_shutdown = False
 	
+	def _check_executor_alive():
+		"""Проверяет, что executor еще работает"""
+		if executor_shutdown:
+			return False
+		try:
+			# Пробуем проверить состояние executor через приватный атрибут
+			# Это безопасно, так как мы обрабатываем исключения
+			if hasattr(trailing_executor, '_shutdown') and trailing_executor._shutdown:
+				return False
+		except (AttributeError, RuntimeError, Exception):
+			# Executor может быть закрыт или недоступен
+			return False
+		return True
+	
 	try:
 		while True:
 			try:
 				# Check if executor is still valid
-				if executor_shutdown:
+				if not _check_executor_alive():
 					print("[Trailing] ⚠️ Executor is shut down, stopping trailing stop management")
 					break
 				
@@ -67,11 +81,24 @@ def manage_trailing_stop(exec_client, symbol, interval, update_interval, directi
 				try:
 					positions_future = trailing_executor.submit(_get_positions_trailing)
 				except RuntimeError as e:
-					if "cannot schedule new futures after shutdown" in str(e) or "shutdown" in str(e).lower():
-						print("[Trailing] ⚠️ Executor was shut down, stopping trailing stop management")
+					error_msg = str(e).lower()
+					if "cannot schedule new futures after shutdown" in error_msg or "shutdown" in error_msg:
+						print(f"[Trailing] ⚠️ Executor was shut down, stopping trailing stop management. Error: {e}")
 						executor_shutdown = True
 						break
-					raise
+					# Другие RuntimeError - логируем и продолжаем
+					print(f"[Trailing] ⚠️ RuntimeError submitting task: {e}")
+					import traceback
+					traceback.print_exc()
+					time.sleep(update_interval)
+					continue
+				except Exception as e:
+					# Любые другие исключения при submit - логируем и продолжаем
+					print(f"[Trailing] ⚠️ Unexpected error submitting task: {e}")
+					import traceback
+					traceback.print_exc()
+					time.sleep(update_interval)
+					continue
 				
 				try:
 					positions = positions_future.result(timeout=5)
@@ -90,14 +117,19 @@ def manage_trailing_stop(exec_client, symbol, interval, update_interval, directi
 							print(f"[Trailing] ⚠️ Error cancelling orders: {e}")
 					
 					try:
-						if not executor_shutdown:
+						if _check_executor_alive():
 							cleanup_future = trailing_executor.submit(_cleanup_trailing)
 							# Не ждем завершения - просто запускаем
+						else:
+							print("[Trailing] ⚠️ Executor was shut down, skipping cleanup")
 					except RuntimeError as e:
-						if "cannot schedule new futures after shutdown" in str(e) or "shutdown" in str(e).lower():
+						error_msg = str(e).lower()
+						if "cannot schedule new futures after shutdown" in error_msg or "shutdown" in error_msg:
 							print("[Trailing] ⚠️ Executor was shut down, skipping cleanup")
 						else:
 							print(f"[Trailing] ⚠️ Error submitting cleanup task: {e}")
+					except Exception as e:
+						print(f"[Trailing] ⚠️ Unexpected error submitting cleanup: {e}")
 					print("[Trailing] Stopping trailing stop management.")
 					break
 				
@@ -112,11 +144,24 @@ def manage_trailing_stop(exec_client, symbol, interval, update_interval, directi
 				try:
 					klines_future = trailing_executor.submit(_get_klines_trailing)
 				except RuntimeError as e:
-					if "cannot schedule new futures after shutdown" in str(e) or "shutdown" in str(e).lower():
-						print("[Trailing] ⚠️ Executor was shut down, stopping trailing stop management")
+					error_msg = str(e).lower()
+					if "cannot schedule new futures after shutdown" in error_msg or "shutdown" in error_msg:
+						print(f"[Trailing] ⚠️ Executor was shut down, stopping trailing stop management. Error: {e}")
 						executor_shutdown = True
 						break
-					raise
+					# Другие RuntimeError - логируем и продолжаем
+					print(f"[Trailing] ⚠️ RuntimeError submitting klines task: {e}")
+					import traceback
+					traceback.print_exc()
+					time.sleep(update_interval)
+					continue
+				except Exception as e:
+					# Любые другие исключения при submit - логируем и продолжаем
+					print(f"[Trailing] ⚠️ Unexpected error submitting klines task: {e}")
+					import traceback
+					traceback.print_exc()
+					time.sleep(update_interval)
+					continue
 				
 				try:
 					kl = klines_future.result(timeout=5)
@@ -280,13 +325,32 @@ def manage_trailing_stop(exec_client, symbol, interval, update_interval, directi
 								raise e  # Пробрасываем исключение для обработки выше
 						
 						try:
-							stop_future = trailing_executor.submit(_update_stop)
-						except RuntimeError as e:
-							if "cannot schedule new futures after shutdown" in str(e) or "shutdown" in str(e).lower():
+							if not _check_executor_alive():
 								print("[Trailing] ⚠️ Executor was shut down, cannot update stop")
 								executor_shutdown = True
 								break
-							raise
+							stop_future = trailing_executor.submit(_update_stop)
+						except RuntimeError as e:
+							error_msg = str(e).lower()
+							if "cannot schedule new futures after shutdown" in error_msg or "shutdown" in error_msg:
+								print(f"[Trailing] ⚠️ Executor was shut down, cannot update stop. Error: {e}")
+								executor_shutdown = True
+								break
+							# Другие RuntimeError - логируем и продолжаем
+							print(f"[Trailing] ⚠️ RuntimeError submitting stop update: {e}")
+							import traceback
+							traceback.print_exc()
+							current_stop = old_stop
+							time.sleep(update_interval)
+							continue
+						except Exception as e:
+							# Любые другие исключения при submit - логируем и продолжаем
+							print(f"[Trailing] ⚠️ Unexpected error submitting stop update: {e}")
+							import traceback
+							traceback.print_exc()
+							current_stop = old_stop
+							time.sleep(update_interval)
+							continue
 						
 						try:
 							resp = stop_future.result(timeout=10)  # Таймаут 10 секунд для обновления стопа
@@ -320,14 +384,16 @@ def manage_trailing_stop(exec_client, symbol, interval, update_interval, directi
 				break
 			except RuntimeError as e:
 				# Handle executor shutdown errors
-				if "cannot schedule new futures after shutdown" in str(e) or "shutdown" in str(e).lower():
-					print("[Trailing] ⚠️ Executor was shut down, stopping trailing stop management")
+				error_msg = str(e).lower()
+				if "cannot schedule new futures after shutdown" in error_msg or "shutdown" in error_msg:
+					print(f"[Trailing] ⚠️ Executor was shut down, stopping trailing stop management. Error: {e}")
 					executor_shutdown = True
 					break
 				else:
 					print(f"[Trailing] ⚠️ Runtime error in trailing stop loop: {e}")
 					import traceback
 					traceback.print_exc()
+					# Продолжаем работу - не останавливаем трейлинг из-за ошибок
 					time.sleep(update_interval)
 			except Exception as e:
 				print(f"[Trailing] ⚠️ Error in trailing stop loop: {e}")
@@ -337,15 +403,22 @@ def manage_trailing_stop(exec_client, symbol, interval, update_interval, directi
 				time.sleep(update_interval)
 	finally:
 		# Properly shutdown the executor
-		if not executor_shutdown:
-			print("[Trailing] Shutting down executor...")
-			trailing_executor.shutdown(wait=False)  # Don't wait to avoid blocking
-		else:
-			# If already shut down, just ensure cleanup
-			try:
+		try:
+			if not executor_shutdown and _check_executor_alive():
+				print("[Trailing] Shutting down executor...")
+				# Используем wait=False чтобы не блокировать, но даем время на завершение
 				trailing_executor.shutdown(wait=False)
-			except:
-				pass
+			else:
+				# If already shut down, just ensure cleanup
+				try:
+					if hasattr(trailing_executor, '_shutdown') and not trailing_executor._shutdown:
+						trailing_executor.shutdown(wait=False)
+				except (AttributeError, RuntimeError, Exception):
+					pass
+		except Exception as e:
+			print(f"[Trailing] ⚠️ Error shutting down executor: {e}")
+			import traceback
+			traceback.print_exc()
 		print("[Trailing] Trailing stop management stopped")
 
 
