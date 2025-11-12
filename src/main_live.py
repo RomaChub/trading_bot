@@ -1120,13 +1120,28 @@ def trade_symbol(symbol: str, args, exec_client, total_balance, use_trailing, dr
 										print(f"[{symbol}] ⚠️ Error getting margin: {e}")
 										return available_margin  # Используем последнее известное значение
 								
-								margin_future = executor.submit(_get_margin)
 								try:
-									current_available_margin = margin_future.result(timeout=5)  # Таймаут 5 секунд
-									available_margin = current_available_margin
-								except FutureTimeoutError:
-									print(f"[{symbol}] ⚠️ Timeout getting margin, using last known value: ${available_margin:.2f}")
-									current_available_margin = available_margin  # Используем последнее известное значение
+									margin_future = executor.submit(_get_margin)
+									try:
+										current_available_margin = margin_future.result(timeout=5)  # Таймаут 5 секунд
+										available_margin = current_available_margin
+									except FutureTimeoutError:
+										print(f"[{symbol}] ⚠️ Timeout getting margin, using last known value: ${available_margin:.2f}")
+										current_available_margin = available_margin  # Используем последнее известное значение
+									except Exception as e:
+										print(f"[{symbol}] ⚠️ Error waiting for margin: {e}")
+										current_available_margin = available_margin  # Используем последнее известное значение
+								except RuntimeError as e:
+									error_msg = str(e).lower()
+									if "cannot schedule new futures after shutdown" in error_msg or "shutdown" in error_msg:
+										print(f"[{symbol}] ⚠️ Executor was shut down, using last known margin: ${available_margin:.2f}")
+										current_available_margin = available_margin
+									else:
+										print(f"[{symbol}] ⚠️ RuntimeError getting margin: {e}, using last known value: ${available_margin:.2f}")
+										current_available_margin = available_margin
+								except Exception as e:
+									print(f"[{symbol}] ⚠️ Unexpected error getting margin: {e}, using last known value: ${available_margin:.2f}")
+									current_available_margin = available_margin
 							if not dry_run and current_available_margin <= 0:
 								print(f"[{symbol}] ❌ ERROR: No available margin. Latest fetched value: ${current_available_margin:.2f}")
 								# Уведомление в Telegram (неблокирующее)
@@ -1157,6 +1172,8 @@ def trade_symbol(symbol: str, args, exec_client, total_balance, use_trailing, dr
 										print(f"[{symbol}] ⚠️ Failed to send Telegram notification: {e}")
 								breakout_found = True
 								traded_zones.add(zone_id)
+								# Продолжаем работу - не останавливаем мониторинг из-за недостатка маржи
+								print(f"[{symbol}] ⚠️ Skipping this breakout due to insufficient margin. Continuing monitoring...")
 								break
 							
 							# Open position (неблокирующая операция)
@@ -1190,17 +1207,43 @@ def trade_symbol(symbol: str, args, exec_client, total_balance, use_trailing, dr
 									return False
 							
 							# Запускаем в отдельном потоке, но ждем результат (с таймаутом)
-							position_future = executor.submit(_open_position_and_orders)
 							try:
-								success = position_future.result(timeout=15)  # Таймаут 15 секунд для открытия позиции
-								if not success:
-									print(f"[{symbol}] ⚠️ Position opening failed")
+								position_future = executor.submit(_open_position_and_orders)
+								try:
+									success = position_future.result(timeout=15)  # Таймаут 15 секунд для открытия позиции
+									if not success:
+										print(f"[{symbol}] ⚠️ Position opening failed")
+										breakout_found = True
+										traded_zones.add(zone_id)
+										break
+								except FutureTimeoutError:
+									print(f"[{symbol}] ⚠️ Timeout opening position, but continuing...")
+									# Продолжаем - позиция может открыться в фоне
 									breakout_found = True
 									traded_zones.add(zone_id)
 									break
-							except FutureTimeoutError:
-								print(f"[{symbol}] ⚠️ Timeout opening position, but continuing...")
-								# Продолжаем - позиция может открыться в фоне
+								except Exception as e:
+									print(f"[{symbol}] ⚠️ Error waiting for position opening: {e}")
+									breakout_found = True
+									traded_zones.add(zone_id)
+									break
+							except RuntimeError as e:
+								error_msg = str(e).lower()
+								if "cannot schedule new futures after shutdown" in error_msg or "shutdown" in error_msg:
+									print(f"[{symbol}] ⚠️ Executor was shut down, cannot open position")
+									breakout_found = True
+									traded_zones.add(zone_id)
+									break
+								else:
+									print(f"[{symbol}] ⚠️ RuntimeError submitting position opening: {e}")
+									breakout_found = True
+									traded_zones.add(zone_id)
+									break
+							except Exception as e:
+								print(f"[{symbol}] ⚠️ Unexpected error submitting position opening: {e}")
+								breakout_found = True
+								traded_zones.add(zone_id)
+								break
 							
 							# Store position info for notifications
 							last_position_info = {
@@ -1316,13 +1359,28 @@ def trade_symbol(symbol: str, args, exec_client, total_balance, use_trailing, dr
 										print(f"[{symbol}] ⚠️ Error getting margin: {e}")
 										return available_margin  # Используем последнее известное значение
 								
-								margin_future = executor.submit(_get_margin)
 								try:
-									current_available_margin = margin_future.result(timeout=5)  # Таймаут 5 секунд
-									available_margin = current_available_margin
-								except FutureTimeoutError:
-									print(f"[{symbol}] ⚠️ Timeout getting margin, using last known value: ${available_margin:.2f}")
-									current_available_margin = available_margin  # Используем последнее известное значение
+									margin_future = executor.submit(_get_margin)
+									try:
+										current_available_margin = margin_future.result(timeout=5)  # Таймаут 5 секунд
+										available_margin = current_available_margin
+									except FutureTimeoutError:
+										print(f"[{symbol}] ⚠️ Timeout getting margin, using last known value: ${available_margin:.2f}")
+										current_available_margin = available_margin  # Используем последнее известное значение
+									except Exception as e:
+										print(f"[{symbol}] ⚠️ Error waiting for margin: {e}")
+										current_available_margin = available_margin  # Используем последнее известное значение
+								except RuntimeError as e:
+									error_msg = str(e).lower()
+									if "cannot schedule new futures after shutdown" in error_msg or "shutdown" in error_msg:
+										print(f"[{symbol}] ⚠️ Executor was shut down, using last known margin: ${available_margin:.2f}")
+										current_available_margin = available_margin
+									else:
+										print(f"[{symbol}] ⚠️ RuntimeError getting margin: {e}, using last known value: ${available_margin:.2f}")
+										current_available_margin = available_margin
+								except Exception as e:
+									print(f"[{symbol}] ⚠️ Unexpected error getting margin: {e}, using last known value: ${available_margin:.2f}")
+									current_available_margin = available_margin
 							if not dry_run and current_available_margin <= 0:
 								print(f"[{symbol}] ❌ ERROR: No available margin. Latest fetched value: ${current_available_margin:.2f}")
 								# Уведомление в Telegram (неблокирующее)
@@ -1353,6 +1411,8 @@ def trade_symbol(symbol: str, args, exec_client, total_balance, use_trailing, dr
 										print(f"[{symbol}] ⚠️ Failed to send Telegram notification: {e}")
 								breakout_found = True
 								traded_zones.add(zone_id)
+								# Продолжаем работу - не останавливаем мониторинг из-за недостатка маржи
+								print(f"[{symbol}] ⚠️ Skipping this breakout due to insufficient margin. Continuing monitoring...")
 								break
 							
 							# Open position (неблокирующая операция)
@@ -1386,17 +1446,43 @@ def trade_symbol(symbol: str, args, exec_client, total_balance, use_trailing, dr
 									return False
 							
 							# Запускаем в отдельном потоке, но ждем результат (с таймаутом)
-							position_future = executor.submit(_open_position_and_orders_short)
 							try:
-								success = position_future.result(timeout=15)  # Таймаут 15 секунд для открытия позиции
-								if not success:
-									print(f"[{symbol}] ⚠️ Position opening failed")
+								position_future = executor.submit(_open_position_and_orders_short)
+								try:
+									success = position_future.result(timeout=15)  # Таймаут 15 секунд для открытия позиции
+									if not success:
+										print(f"[{symbol}] ⚠️ Position opening failed")
+										breakout_found = True
+										traded_zones.add(zone_id)
+										break
+								except FutureTimeoutError:
+									print(f"[{symbol}] ⚠️ Timeout opening position, but continuing...")
+									# Продолжаем - позиция может открыться в фоне
 									breakout_found = True
 									traded_zones.add(zone_id)
 									break
-							except FutureTimeoutError:
-								print(f"[{symbol}] ⚠️ Timeout opening position, but continuing...")
-								# Продолжаем - позиция может открыться в фоне
+								except Exception as e:
+									print(f"[{symbol}] ⚠️ Error waiting for position opening: {e}")
+									breakout_found = True
+									traded_zones.add(zone_id)
+									break
+							except RuntimeError as e:
+								error_msg = str(e).lower()
+								if "cannot schedule new futures after shutdown" in error_msg or "shutdown" in error_msg:
+									print(f"[{symbol}] ⚠️ Executor was shut down, cannot open position")
+									breakout_found = True
+									traded_zones.add(zone_id)
+									break
+								else:
+									print(f"[{symbol}] ⚠️ RuntimeError submitting position opening: {e}")
+									breakout_found = True
+									traded_zones.add(zone_id)
+									break
+							except Exception as e:
+								print(f"[{symbol}] ⚠️ Unexpected error submitting position opening: {e}")
+								breakout_found = True
+								traded_zones.add(zone_id)
+								break
 							
 							# Store position info for notifications
 							last_position_info = {
@@ -1553,6 +1639,19 @@ def trade_symbol(symbol: str, args, exec_client, total_balance, use_trailing, dr
 			import traceback
 			traceback.print_exc()
 			time.sleep(args.update_interval)
+		finally:
+			# Properly shutdown the executor
+			try:
+				print(f"[{symbol}] Shutting down executor...")
+				executor.shutdown(wait=False)
+			except Exception as e:
+				print(f"[{symbol}] ⚠️ Error shutting down executor: {e}")
+			if live_chart:
+				try:
+					live_chart.stop()
+				except Exception as e:
+					print(f"[{symbol}] ⚠️ Error stopping live chart: {e}")
+			print(f"[{symbol}] Trading thread stopped")
 
 
 def main():
