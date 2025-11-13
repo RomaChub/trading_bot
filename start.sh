@@ -46,14 +46,13 @@ else
 fi
 
 # Start the application
-echo "✅ Starting trading bot..."
-exec python3 -m src.main_live \
+echo "✅ Starting trading bot (refactored version with async)..."
+exec python3 -m src.main_live_refactored \
     --symbols "$DEFAULT_SYMBOLS" \
     --interval "$DEFAULT_INTERVAL" \
     --lookback_days 60 \
     --leverage 15 \
     --risk_per_trade "$RISK_PER_TRADE" \
-    --allow_multiple_positions false \
     --dry_run false \
     --use_trailing_stop true \
     --trailing_mode step \
