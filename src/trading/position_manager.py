@@ -66,6 +66,12 @@ class PositionManager:
         """Handle position closure - cleanup and notify"""
         logger.info(f"[{self.symbol}] 🔄 Position closed. Cleaning up...")
         
+        # Release zone for re-trading (allows re-entry after false breakouts)
+        if hasattr(self, 'trader') and self.trader and self.trader.current_zone_id is not None:
+            old_zone = self.trader.current_zone_id
+            self.trader.current_zone_id = None
+            logger.info(f"[{self.symbol}] 🔓 Зона #{old_zone} снова доступна для торговли")
+        
         # Cancel orders
         try:
             await asyncio.wait_for(

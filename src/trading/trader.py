@@ -36,8 +36,9 @@ class SymbolTrader:
         self.position_manager = PositionManager(
             exec_client, symbol, dry_run, telegram_notifier
         )
+        self.position_manager.trader = self  # Link to trader for zone management
         self.breakout_detector = BreakoutDetector(
-            symbol, exec_client, args.zone_max_age_hours
+            symbol, exec_client, args.zone_max_age_hours, self
         )
         
         # Live chart
@@ -60,6 +61,7 @@ class SymbolTrader:
         self.trailing_status = {}
         self.notification_sent = {}
         self._running = False
+        self.current_zone_id = None  # ID зоны текущей открытой позиции
     
     async def initialize(self):
         """Initialize trader - load data, check positions, etc."""
@@ -213,7 +215,8 @@ class SymbolTrader:
                     await self._check_breakouts(current_time)
                 else:
                     if iteration % 10 == 0:
-                        logger.info(f"[{self.symbol}] 📊 Позиция открыта, ожидание выхода...")
+                        zone_info = f" (зона #{self.current_zone_id})" if self.current_zone_id else ""
+                        logger.info(f"[{self.symbol}] 📊 Позиция открыта{zone_info}, ожидание выхода...")
                 
                 # Refresh data periodically
                 import time
@@ -296,9 +299,6 @@ class SymbolTrader:
         logger.info(f"[{self.symbol}] 🚨 BREAKOUT DETECTED! Zone {zone_id} | {direction}")
         logger.info(f"   Zone: ${zone_low:.2f} - ${zone_high:.2f}")
         
-        # Mark as traded
-        self.breakout_detector.mark_zone_traded(zone_id)
-        
         # Calculate position parameters
         current_price = await self._get_current_price()
         
@@ -352,6 +352,10 @@ class SymbolTrader:
         if not success:
             return
         
+        # Mark zone as active (locked for current position)
+        self.current_zone_id = zone_id
+        logger.info(f"[{self.symbol}] 📍 Активная зона для позиции: #{zone_id}")
+        
         # Update chart
         if self.live_chart:
             try:
@@ -402,18 +406,17 @@ class SymbolTrader:
         
         if updated:
             logger.info(f"[{self.symbol}] ✅ Данные обновлены, пересчитываю зоны...")
+            old_zone_count = len(self.zones)
             self.zones = await self._compute_zones()
             
-            # Cleanup traded zones
-            available_ids = {z.get("zone_id", i) for i, z in enumerate(self.zones)}
-            self.breakout_detector.cleanup_old_zones(available_ids)
+            # Check if active zone still exists
+            if self.current_zone_id is not None:
+                available_ids = {z.get("zone_id", i) for i, z in enumerate(self.zones)}
+                if self.current_zone_id not in available_ids:
+                    logger.warning(f"[{self.symbol}] ⚠️ Активная зона #{self.current_zone_id} исчезла после обновления данных")
         elif not self.zones:
             logger.info(f"[{self.symbol}] 📊 Новых данных нет, но зоны отсутствуют, пересчитываю...")
             self.zones = await self._compute_zones()
-            
-            # Cleanup traded zones
-            available_ids = {z.get("zone_id", i) for i, z in enumerate(self.zones)}
-            self.breakout_detector.cleanup_old_zones(available_ids)
         else:
             logger.info(f"[{self.symbol}] ✓ Данные актуальны (зон: {len(self.zones)})")
     

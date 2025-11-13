@@ -1,8 +1,11 @@
 """Trailing stop management with async support"""
 import asyncio
+import logging
 from datetime import datetime
 from typing import Optional, Dict
 import pytz
+
+logger = logging.getLogger(__name__)
 
 
 class TrailingStopManager:
@@ -47,9 +50,9 @@ class TrailingStopManager:
         else:
             self.trail_threshold = entry_price - self.trail_activate_rr * self.risk
         
-        print(f"[Trailing] Started for {direction} position")
-        print(f"[Trailing] Entry: ${entry_price:.2f}, Stop: ${initial_stop:.2f}, Risk: ${self.risk:.2f}")
-        print(f"[Trailing] Activation threshold: ${self.trail_threshold:.2f}")
+        logger.info(f"[Trailing] Started for {direction} position")
+        logger.info(f"[Trailing] Entry: ${entry_price:.2f}, Stop: ${initial_stop:.2f}, Risk: ${self.risk:.2f}")
+        logger.info(f"[Trailing] Activation threshold: ${self.trail_threshold:.2f}")
     
     async def check_position_exists(self) -> bool:
         """Check if position still exists"""
@@ -60,10 +63,10 @@ class TrailingStopManager:
             )
             return any(abs(float(p.get("positionAmt", 0))) > 0 for p in positions)
         except asyncio.TimeoutError:
-            print("[Trailing] ⚠️ Timeout checking position, assuming exists")
+            logger.warning("[Trailing] ⚠️ Timeout checking position, assuming exists")
             return True
         except Exception as e:
-            print(f"[Trailing] ⚠️ Error checking position: {e}")
+            logger.warning(f"[Trailing] ⚠️ Error checking position: {e}")
             return True
     
     async def get_latest_kline(self):
@@ -76,10 +79,10 @@ class TrailingStopManager:
             )
             return klines[-1] if klines else None
         except asyncio.TimeoutError:
-            print("[Trailing] ⚠️ Timeout fetching klines")
+            logger.warning("[Trailing] ⚠️ Timeout fetching klines")
             return None
         except Exception as e:
-            print(f"[Trailing] ⚠️ Error fetching klines: {e}")
+            logger.warning(f"[Trailing] ⚠️ Error fetching klines: {e}")
             return None
     
     def calculate_new_stop(self, candle_high: float, candle_low: float) -> float:
@@ -149,7 +152,7 @@ class TrailingStopManager:
             self.trailing_active = True
             self.trailing_status_dict[self.symbol] = True
             
-            print(f"[Trailing] ✅ Activated! Price: ${high if self.direction == 'LONG' else low:.2f}")
+            logger.info(f"[Trailing] ✅ Activated! Price: ${high if self.direction == 'LONG' else low:.2f}")
             
             # Initialize step counter
             if self.trail_mode == "step" and self.trail_step_pct > 0:
@@ -172,7 +175,7 @@ class TrailingStopManager:
                         rr_ratio=self.trail_activate_rr
                     )
                 except Exception as e:
-                    print(f"[Trailing] ⚠️ Failed to send notification: {e}")
+                    logger.warning(f"[Trailing] ⚠️ Failed to send notification: {e}")
         
         return activated
     
@@ -195,22 +198,22 @@ class TrailingStopManager:
             )
             
             self.current_stop = new_stop
-            print(f"[Trailing] ✅ Stop updated: ${old_stop:.2f} -> ${new_stop:.2f}")
+            logger.info(f"[Trailing] ✅ Stop updated: ${old_stop:.2f} -> ${new_stop:.2f}")
             return True
             
         except asyncio.TimeoutError:
-            print("[Trailing] ⚠️ Timeout updating stop")
+            logger.warning("[Trailing] ⚠️ Timeout updating stop")
             return False
         except ValueError as e:
-            print(f"[Trailing] ⚠️ Stop too close to price: {e}")
+            logger.warning(f"[Trailing] ⚠️ Stop too close to price: {e}")
             return False
         except Exception as e:
-            print(f"[Trailing] ⚠️ Error updating stop: {e}")
+            logger.warning(f"[Trailing] ⚠️ Error updating stop: {e}")
             return False
     
     async def handle_position_closed(self):
         """Handle position closure - cleanup and notify"""
-        print("[Trailing] Position closed. Cleaning up...")
+        logger.info("[Trailing] Position closed. Cleaning up...")
         
         # Get exit price
         exit_price = await self._get_exit_price()
@@ -239,9 +242,9 @@ class TrailingStopManager:
                     reason=reason
                 )
                 self.notification_sent_dict[self.symbol] = True
-                print(f"[Trailing] ✅ Notification sent (Exit: ${exit_price:.2f}, P&L: ${pnl:.2f})")
+                logger.info(f"[Trailing] ✅ Notification sent (Exit: ${exit_price:.2f}, P&L: ${pnl:.2f})")
             except Exception as e:
-                print(f"[Trailing] ⚠️ Failed to send notification: {e}")
+                logger.warning(f"[Trailing] ⚠️ Failed to send notification: {e}")
         
         # Cleanup orders
         try:
@@ -250,7 +253,7 @@ class TrailingStopManager:
                 timeout=5.0
             )
         except Exception as e:
-            print(f"[Trailing] ⚠️ Error cancelling orders: {e}")
+            logger.warning(f"[Trailing] ⚠️ Error cancelling orders: {e}")
     
     async def _get_exit_price(self) -> float:
         """Get current price as exit price"""
@@ -261,7 +264,7 @@ class TrailingStopManager:
             )
             return float(ticker['price'])
         except Exception as e:
-            print(f"[Trailing] ⚠️ Error getting exit price: {e}")
+            logger.warning(f"[Trailing] ⚠️ Error getting exit price: {e}")
             return self.entry_price
     
     async def run(self, update_interval: int = 5):
@@ -291,14 +294,14 @@ class TrailingStopManager:
                 if self.trailing_active:
                     await self.update_stop_loss(new_stop, close)
                 
-                await asyncio.sleep(update_interval)
-                
+            await asyncio.sleep(update_interval)
+            
         except asyncio.CancelledError:
-            print("[Trailing] Stopped by cancellation")
+            logger.info("[Trailing] Stopped by cancellation")
         except Exception as e:
-            print(f"[Trailing] ⚠️ Error in main loop: {e}")
+            logger.error(f"[Trailing] ⚠️ Error in main loop: {e}")
         finally:
-            print("[Trailing] Trailing stop management stopped")
+            logger.info("[Trailing] Trailing stop management stopped")
     
     def stop(self):
         """Stop trailing stop management"""

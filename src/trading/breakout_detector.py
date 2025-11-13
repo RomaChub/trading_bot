@@ -1,5 +1,6 @@
 """Breakout detection logic"""
 import asyncio
+import logging
 from typing import List, Optional, Dict, Tuple
 from datetime import datetime, timedelta
 import pandas as pd
@@ -7,15 +8,18 @@ import pytz
 
 from src.utils.time_utils import ensure_utc
 
+logger = logging.getLogger(__name__)
+
 
 class BreakoutDetector:
     """Detects breakouts from accumulation zones"""
     
-    def __init__(self, symbol: str, exec_client, zone_max_age_hours: int = 48):
+    def __init__(self, symbol: str, exec_client, zone_max_age_hours: int = 48, trader=None):
         self.symbol = symbol
         self.exec_client = exec_client
         self.zone_max_age_hours = zone_max_age_hours
-        self.traded_zones = set()
+        self.trader = trader  # Reference to trader for current_zone_id
+        self.traded_zones = set()  # Keep for backward compatibility
     
     def filter_active_zones(self, zones: List[Dict], current_price: float,
                           current_time: datetime) -> List[Dict]:
@@ -80,16 +84,17 @@ class BreakoutDetector:
     
     def get_newest_untraded_zone(self, zones: List[Dict], 
                                 current_time: datetime) -> Optional[Dict]:
-        """Get the newest zone that hasn't been traded yet"""
+        """Get the newest zone that hasn't been traded yet (not currently in use)"""
         max_age = timedelta(hours=self.zone_max_age_hours)
         candidate_zones = []
         
         for zone in zones:
             zone_id = zone.get('zone_id', -1)
             
-            # Skip traded zones
-            if zone_id in self.traded_zones:
-                continue
+            # Skip ONLY the zone with active position (allows re-entry after false breakout)
+            if self.trader and self.trader.current_zone_id is not None:
+                if zone_id == self.trader.current_zone_id:
+                    continue
             
             zone_end = ensure_utc(zone.get('end'))
             
@@ -107,7 +112,14 @@ class BreakoutDetector:
             return None
         
         # Return newest zone (latest end time)
-        return max(candidate_zones, key=lambda z: ensure_utc(z.get('end')))
+        newest_zone = max(candidate_zones, key=lambda z: ensure_utc(z.get('end')))
+        
+        # Log if it's different from current active zone
+        if self.trader and self.trader.current_zone_id:
+            if newest_zone.get('zone_id') != self.trader.current_zone_id:
+                logger.debug(f"[{self.symbol}] Мониторинг новой зоны #{newest_zone.get('zone_id')} (активная: #{self.trader.current_zone_id})")
+        
+        return newest_zone
     
     async def get_recent_klines(self, interval: str, limit: int = 20):
         """Fetch recent klines"""
@@ -139,10 +151,10 @@ class BreakoutDetector:
             return df
             
         except asyncio.TimeoutError:
-            print(f"[{self.symbol}] ⚠️ Timeout fetching klines")
+            logger.warning(f"[{self.symbol}] ⚠️ Timeout fetching klines")
             return None
         except Exception as e:
-            print(f"[{self.symbol}] ⚠️ Error fetching klines: {e}")
+            logger.warning(f"[{self.symbol}] ⚠️ Error fetching klines: {e}")
             return None
     
     def get_closed_candles(self, df: pd.DataFrame, current_time: datetime) -> pd.DataFrame:
