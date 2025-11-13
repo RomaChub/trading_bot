@@ -3,6 +3,7 @@ Refactored live trading script with async support and clean architecture
 """
 import argparse
 import asyncio
+import logging
 import warnings
 from typing import List
 
@@ -13,6 +14,14 @@ from src.notifications.telegram_bot import TelegramNotifier
 from src.trading.trader import SymbolTrader
 
 warnings.filterwarnings('ignore')
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+logger = logging.getLogger(__name__)
 
 
 async def trade_symbols(symbols: List[str], args, exec_client,
@@ -38,14 +47,14 @@ async def trade_symbols(symbols: List[str], args, exec_client,
         await trader.initialize()
         traders.append(trader)
         
-        print(f"✅ Started trading for {symbol}" + 
-              (f" (chart on port {chart_port})" if chart_port else ""))
+        logger.info(f"✅ Started trading for {symbol}" + 
+                   (f" (chart on port {chart_port})" if chart_port else ""))
     
     # Run all traders concurrently
     try:
         await asyncio.gather(*[trader.run() for trader in traders])
     except KeyboardInterrupt:
-        print("\n⏹️ Stopping all traders...")
+        logger.info("\n⏹️ Stopping all traders...")
         for trader in traders:
             trader.stop()
         
@@ -185,23 +194,23 @@ def main():
         symbols = [args.symbol.upper()]
     
     # Print startup info
-    print(f"\n{'='*60}")
-    print(f"🚀 Multi-Symbol Trading Bot")
-    print(f"📊 Symbols: {', '.join(symbols)}")
-    print(f"{'='*60}\n")
+    logger.info(f"\n{'='*60}")
+    logger.info(f"🚀 Multi-Symbol Trading Bot")
+    logger.info(f"📊 Symbols: {', '.join(symbols)}")
+    logger.info(f"{'='*60}\n")
     
     # Get balance
     total_balance = exec_client.get_available_balance("USDT")
-    print(f"[Global] Total balance: ${total_balance:.2f} USDT")
+    logger.info(f"[Global] Total balance: ${total_balance:.2f} USDT")
     
     # Check position mode
     current_mode = exec_client.get_position_mode()
-    print(f"[Global] Position mode: {current_mode}")
+    logger.info(f"[Global] Position mode: {current_mode}")
     
     if current_mode == "Hedge":
-        print("⚠️ Hedge Mode detected")
+        logger.warning("⚠️ Hedge Mode detected")
     else:
-        print("✅ One-way Mode - optimal")
+        logger.info("✅ One-way Mode - optimal")
     
     # Run trading
     try:
@@ -212,7 +221,7 @@ def main():
             )
         )
     except KeyboardInterrupt:
-        print("\n⏹️ Shutdown complete")
+        logger.info("\n⏹️ Shutdown complete")
 
 
 if __name__ == "__main__":

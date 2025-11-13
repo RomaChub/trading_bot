@@ -1,5 +1,6 @@
 """Main trading orchestrator"""
 import asyncio
+import logging
 from typing import Optional
 from datetime import datetime
 import pytz
@@ -13,6 +14,8 @@ from src.backtest.engine import BacktestEngine
 from src.plotting.live_chart import LiveChart
 from src.utils.time_utils import estimate_candles_needed
 from src.config.params import ACCUMULATION_PARAMS
+
+logger = logging.getLogger(__name__)
 
 
 class SymbolTrader:
@@ -60,9 +63,9 @@ class SymbolTrader:
     
     async def initialize(self):
         """Initialize trader - load data, check positions, etc."""
-        print(f"\n{'='*60}")
-        print(f"🚀 Starting trading for {self.symbol}")
-        print(f"{'='*60}\n")
+        logger.info(f"\n{'='*60}")
+        logger.info(f"🚀 Starting trading for {self.symbol}")
+        logger.info(f"{'='*60}\n")
         
         # Check existing positions
         await self._check_existing_positions()
@@ -79,15 +82,15 @@ class SymbolTrader:
             self.live_chart.update_data(self.loader.df, self.zones, current_price)
             self.live_chart.start()
         
-        print(f"[{self.symbol}] 🔄 Starting real-time monitoring...")
+        logger.info(f"[{self.symbol}] 🔄 Starting real-time monitoring...")
     
     async def _check_existing_positions(self):
         """Check for existing open positions"""
         positions = await self.position_manager.get_open_positions()
         if positions:
-            print(f"[{self.symbol}] ⚠️ Found {len(positions)} open position(s)")
+            logger.warning(f"[{self.symbol}] ⚠️ Found {len(positions)} open position(s)")
             for pos in positions:
-                print(f"  - {pos['symbol']}: {pos['positionAmt']} @ ${float(pos['entryPrice']):.2f}")
+                logger.info(f"  - {pos['symbol']}: {pos['positionAmt']} @ ${float(pos['entryPrice']):.2f}")
     
     async def _setup_trading(self):
         """Setup margin type and leverage"""
@@ -101,38 +104,46 @@ class SymbolTrader:
                 self.exec_client.set_leverage, self.symbol, leverage
             )
             
-            print(f"[{self.symbol}] ✅ Leverage set to {leverage}x")
+            logger.info(f"[{self.symbol}] ✅ Leverage set to {leverage}x")
         except Exception as e:
-            print(f"[{self.symbol}] ⚠️ Error setting up trading: {e}")
+            logger.warning(f"[{self.symbol}] ⚠️ Error setting up trading: {e}")
     
     async def _load_data(self):
         """Load historical and live data"""
+        logger.info(f"[{self.symbol}] 📥 Загрузка исторических данных...")
         df = await asyncio.to_thread(self.loader.load)
         if df is None:
+            logger.info(f"[{self.symbol}] 📥 Кэш не найден, загружаю с биржи...")
             df = await asyncio.to_thread(self.loader.fetch_with_simple_pagination)
+        else:
+            logger.info(f"[{self.symbol}] ✅ Загружено из кэша: {len(df)} свечей")
         
         # Refresh with live data
         live_limit = estimate_candles_needed(
             self.args.interval, self.args.lookback_days
         )
+        logger.info(f"[{self.symbol}] 🔄 Обновление актуальными данными...")
         live_df, _ = await asyncio.to_thread(
             self.loader.refresh_live_data, live_limit
         )
         
         if live_df is not None and not live_df.empty:
             self.loader.df = live_df
+            logger.info(f"[{self.symbol}] ✅ Данные обновлены: {len(live_df)} свечей")
         
         # Compute zones
+        logger.info(f"[{self.symbol}] 🔍 Начинаю поиск зон накопления...")
         self.zones = await self._compute_zones()
         
         if self.zones:
-            print(f"[{self.symbol}] 📈 Detected {len(self.zones)} accumulation zone(s)")
+            logger.info(f"[{self.symbol}] 📈 Detected {len(self.zones)} accumulation zone(s)")
         else:
-            print(f"[{self.symbol}] ⚠️ No accumulation zones detected yet")
+            logger.warning(f"[{self.symbol}] ⚠️ No accumulation zones detected yet")
     
     async def _compute_zones(self):
         """Compute accumulation zones"""
         if self.loader.df is None or self.loader.df.empty:
+            logger.warning(f"[{self.symbol}] ⚠️ Нет данных для вычисления зон")
             return []
         
         def _compute():
@@ -140,7 +151,18 @@ class SymbolTrader:
             _, zones = engine.get_all_zones()
             return zones or []
         
-        return await asyncio.to_thread(_compute)
+        zones = await asyncio.to_thread(_compute)
+        logger.info(f"[{self.symbol}] 📍 Обнаружено зон накопления: {len(zones)}")
+        
+        if zones:
+            # Log details of newest zones
+            for i, zone in enumerate(zones[:3]):  # Show first 3 zones
+                zone_id = zone.get('zone_id', i)
+                zone_high = zone.get('high', 0)
+                zone_low = zone.get('low', 0)
+                logger.info(f"[{self.symbol}]    Зона #{zone_id}: ${zone_low:.2f} - ${zone_high:.2f}")
+        
+        return zones
     
     async def _get_current_price(self) -> float:
         """Get current market price"""
@@ -154,7 +176,7 @@ class SymbolTrader:
             )
             return float(ticker['price'])
         except Exception as e:
-            print(f"[{self.symbol}] ⚠️ Error getting price: {e}")
+            logger.warning(f"[{self.symbol}] ⚠️ Error getting price: {e}")
             return 0.0
     
     async def run(self):
@@ -163,10 +185,18 @@ class SymbolTrader:
         update_interval = self.args.update_interval
         data_refresh_interval = max(1, self.args.data_refresh_interval)
         last_data_refresh = 0
+        iteration = 0
+        
+        logger.info(f"[{self.symbol}] 🔄 Главный цикл запущен (интервал обновления: {update_interval}с, обновление данных: {data_refresh_interval}с)")
         
         try:
             while self._running:
+                iteration += 1
                 current_time = datetime.now(pytz.UTC)
+                
+                # Log every 10th iteration to avoid spam
+                if iteration % 10 == 0:
+                    logger.info(f"[{self.symbol}] 🔁 Цикл #{iteration} | Время: {current_time.strftime('%H:%M:%S')}")
                 
                 # Check if position closed
                 await self.position_manager.check_position_closed()
@@ -181,11 +211,15 @@ class SymbolTrader:
                 has_position = await self.position_manager.has_position()
                 if not has_position:
                     await self._check_breakouts(current_time)
+                else:
+                    if iteration % 10 == 0:
+                        logger.info(f"[{self.symbol}] 📊 Позиция открыта, ожидание выхода...")
                 
                 # Refresh data periodically
                 import time
                 now = time.time()
                 if now - last_data_refresh >= data_refresh_interval:
+                    logger.info(f"[{self.symbol}] 🔄 Обновление данных и пересчет зон...")
                     await self._refresh_data()
                     last_data_refresh = now
                 
@@ -196,9 +230,9 @@ class SymbolTrader:
                 await asyncio.sleep(update_interval)
                 
         except asyncio.CancelledError:
-            print(f"[{self.symbol}] ⏹️ Trading stopped")
+            logger.info(f"[{self.symbol}] ⏹️ Trading stopped")
         except Exception as e:
-            print(f"[{self.symbol}] ❌ Error in trading loop: {e}")
+            logger.error(f"[{self.symbol}] ❌ Error in trading loop: {e}")
             import traceback
             traceback.print_exc()
         finally:
@@ -232,6 +266,11 @@ class SymbolTrader:
         if not zone:
             return
         
+        zone_id = zone.get('zone_id', -1)
+        zone_high = float(zone['high'])
+        zone_low = float(zone['low'])
+        candle_close = float(latest_candle['close'])
+        
         # Detect breakout
         direction = self.breakout_detector.detect_breakout(
             zone, latest_candle, current_time
@@ -239,6 +278,14 @@ class SymbolTrader:
         
         if direction:
             await self._handle_breakout(zone, direction)
+        else:
+            # Log zone monitoring status every 50 checks
+            if not hasattr(self, '_breakout_check_count'):
+                self._breakout_check_count = 0
+            self._breakout_check_count += 1
+            
+            if self._breakout_check_count % 50 == 0:
+                logger.info(f"[{self.symbol}] 👀 Мониторинг зоны #{zone_id} | Цена: ${candle_close:.2f} | Диапазон: ${zone_low:.2f}-${zone_high:.2f}")
     
     async def _handle_breakout(self, zone: dict, direction: str):
         """Handle detected breakout - open position"""
@@ -246,8 +293,8 @@ class SymbolTrader:
         zone_high = float(zone['high'])
         zone_low = float(zone['low'])
         
-        print(f"[{self.symbol}] 🚨 BREAKOUT DETECTED! Zone {zone_id} | {direction}")
-        print(f"   Zone: ${zone_low:.2f} - ${zone_high:.2f}")
+        logger.info(f"[{self.symbol}] 🚨 BREAKOUT DETECTED! Zone {zone_id} | {direction}")
+        logger.info(f"   Zone: ${zone_low:.2f} - ${zone_high:.2f}")
         
         # Mark as traded
         self.breakout_detector.mark_zone_traded(zone_id)
@@ -281,7 +328,7 @@ class SymbolTrader:
         )
         
         if not rv["valid"]:
-            print(f"[{self.symbol}] ❌ minNotional not satisfied")
+            logger.warning(f"[{self.symbol}] ❌ minNotional not satisfied")
             return
         
         position_qty = float(rv["qty"])
@@ -293,7 +340,7 @@ class SymbolTrader:
         )
         
         if not has_margin:
-            print(f"[{self.symbol}] ⚠️ Insufficient margin, skipping")
+            logger.warning(f"[{self.symbol}] ⚠️ Insufficient margin, skipping")
             return
         
         # Open position
@@ -314,7 +361,7 @@ class SymbolTrader:
                     zone_id, stop_loss, take_profit
                 )
             except Exception as e:
-                print(f"[{self.symbol}] ⚠️ Failed to update chart: {e}")
+                logger.warning(f"[{self.symbol}] ⚠️ Failed to update chart: {e}")
         
         # Start trailing stop
         if self.args.use_trailing_stop.lower() == "true":
@@ -339,7 +386,7 @@ class SymbolTrader:
         self.trailing_task = asyncio.create_task(
             trailing_manager.run(self.args.update_interval)
         )
-        print(f"[{self.symbol}] 🔄 Trailing stop started")
+        logger.info(f"[{self.symbol}] 🔄 Trailing stop started")
     
     async def _refresh_data(self):
         """Refresh live data and recompute zones"""
@@ -347,20 +394,32 @@ class SymbolTrader:
             self.args.interval, self.args.lookback_days
         )
         
+        logger.info(f"[{self.symbol}] 📊 Загрузка свежих данных (лимит свечей: {live_limit})...")
+        
         live_df, updated = await asyncio.to_thread(
             self.loader.refresh_live_data, live_limit
         )
         
-        if updated or not self.zones:
+        if updated:
+            logger.info(f"[{self.symbol}] ✅ Данные обновлены, пересчитываю зоны...")
             self.zones = await self._compute_zones()
             
             # Cleanup traded zones
             available_ids = {z.get("zone_id", i) for i, z in enumerate(self.zones)}
             self.breakout_detector.cleanup_old_zones(available_ids)
+        elif not self.zones:
+            logger.info(f"[{self.symbol}] 📊 Новых данных нет, но зоны отсутствуют, пересчитываю...")
+            self.zones = await self._compute_zones()
+            
+            # Cleanup traded zones
+            available_ids = {z.get("zone_id", i) for i, z in enumerate(self.zones)}
+            self.breakout_detector.cleanup_old_zones(available_ids)
+        else:
+            logger.info(f"[{self.symbol}] ✓ Данные актуальны (зон: {len(self.zones)})")
     
     async def cleanup(self):
         """Cleanup resources"""
-        print(f"[{self.symbol}] Cleaning up...")
+        logger.info(f"[{self.symbol}] Cleaning up...")
         
         if self.trailing_task and not self.trailing_task.done():
             self.trailing_task.cancel()
@@ -373,9 +432,9 @@ class SymbolTrader:
             try:
                 self.live_chart.stop()
             except Exception as e:
-                print(f"[{self.symbol}] ⚠️ Error stopping chart: {e}")
+                logger.warning(f"[{self.symbol}] ⚠️ Error stopping chart: {e}")
         
-        print(f"[{self.symbol}] ✅ Cleanup complete")
+        logger.info(f"[{self.symbol}] ✅ Cleanup complete")
     
     def stop(self):
         """Stop trading"""

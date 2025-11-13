@@ -1,7 +1,10 @@
 """Position management logic"""
 import asyncio
+import logging
 from typing import Optional, Dict
 from dataclasses import dataclass
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -35,10 +38,10 @@ class PositionManager:
                 timeout=5.0
             )
         except asyncio.TimeoutError:
-            print(f"[{self.symbol}] ⚠️ Timeout getting positions")
+            logger.warning(f"[{self.symbol}] ⚠️ Timeout getting positions")
             return []
         except Exception as e:
-            print(f"[{self.symbol}] ⚠️ Error getting positions: {e}")
+            logger.warning(f"[{self.symbol}] ⚠️ Error getting positions: {e}")
             return []
     
     async def has_position(self) -> bool:
@@ -61,7 +64,7 @@ class PositionManager:
     
     async def _handle_position_closed(self):
         """Handle position closure - cleanup and notify"""
-        print(f"[{self.symbol}] 🔄 Position closed. Cleaning up...")
+        logger.info(f"[{self.symbol}] 🔄 Position closed. Cleaning up...")
         
         # Cancel orders
         try:
@@ -70,7 +73,7 @@ class PositionManager:
                 timeout=5.0
             )
         except Exception as e:
-            print(f"[{self.symbol}] ⚠️ Error cancelling orders: {e}")
+            logger.warning(f"[{self.symbol}] ⚠️ Error cancelling orders: {e}")
         
         # Notify if we have position info
         if self.telegram_notifier and self.current_position:
@@ -92,9 +95,9 @@ class PositionManager:
                     by_trailing=False,
                     reason="Take Profit" if pnl > 0 else "Stop Loss"
                 )
-                print(f"[{self.symbol}] ✅ Position close notification sent")
+                logger.info(f"[{self.symbol}] ✅ Position close notification sent")
             except Exception as e:
-                print(f"[{self.symbol}] ⚠️ Failed to send notification: {e}")
+                logger.warning(f"[{self.symbol}] ⚠️ Failed to send notification: {e}")
         
         self.current_position = None
     
@@ -107,7 +110,7 @@ class PositionManager:
             )
             return float(ticker['price'])
         except Exception as e:
-            print(f"[{self.symbol}] ⚠️ Error getting price: {e}")
+            logger.warning(f"[{self.symbol}] ⚠️ Error getting price: {e}")
             return 0.0
     
     async def open_position(self, direction: str, entry_price: float, 
@@ -133,9 +136,9 @@ class PositionManager:
             )
             
             if self.dry_run:
-                print(f"[{self.symbol}] DRY RUN: Position would be opened")
+                logger.info(f"[{self.symbol}] DRY RUN: Position would be opened")
             else:
-                print(f"[{self.symbol}] ✅ Position opened: {direction} {quantity} @ ${entry_price:.2f}")
+                logger.info(f"[{self.symbol}] ✅ Position opened: {direction} {quantity} @ ${entry_price:.2f}")
             
             # Place stop loss
             await asyncio.wait_for(
@@ -180,10 +183,10 @@ class PositionManager:
             return True
             
         except asyncio.TimeoutError:
-            print(f"[{self.symbol}] ⚠️ Timeout opening position")
+            logger.warning(f"[{self.symbol}] ⚠️ Timeout opening position")
             return False
         except Exception as e:
-            print(f"[{self.symbol}] ❌ Error opening position: {e}")
+            logger.error(f"[{self.symbol}] ❌ Error opening position: {e}")
             return False
     
     async def validate_margin(self, entry_price: float, quantity: float, 
@@ -202,22 +205,22 @@ class PositionManager:
             )
             
             if available <= 0:
-                print(f"[{self.symbol}] ❌ No available margin")
+                logger.error(f"[{self.symbol}] ❌ No available margin")
                 await self._send_margin_error(0, required_margin)
                 return False
             
             if required_margin > available:
-                print(f"[{self.symbol}] ❌ Insufficient margin. Required: ${required_margin:.2f}, Available: ${available:.2f}")
+                logger.error(f"[{self.symbol}] ❌ Insufficient margin. Required: ${required_margin:.2f}, Available: ${available:.2f}")
                 await self._send_margin_error(available, required_margin)
                 return False
             
             return True
             
         except asyncio.TimeoutError:
-            print(f"[{self.symbol}] ⚠️ Timeout checking margin, assuming sufficient")
+            logger.warning(f"[{self.symbol}] ⚠️ Timeout checking margin, assuming sufficient")
             return True
         except Exception as e:
-            print(f"[{self.symbol}] ⚠️ Error checking margin: {e}")
+            logger.warning(f"[{self.symbol}] ⚠️ Error checking margin: {e}")
             return True
     
     async def _send_margin_error(self, available: float, required: float):
@@ -233,5 +236,5 @@ class PositionManager:
                 f"Доступно: ${available:.2f} USDT"
             )
         except Exception as e:
-            print(f"[{self.symbol}] ⚠️ Failed to send margin error: {e}")
+            logger.warning(f"[{self.symbol}] ⚠️ Failed to send margin error: {e}")
 
