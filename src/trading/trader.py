@@ -12,7 +12,7 @@ from src.trading.breakout_detector import BreakoutDetector
 from src.data.binance_data import BinanceDataLoader
 from src.backtest.engine import BacktestEngine
 from src.plotting.live_chart import LiveChart
-from src.utils.time_utils import estimate_candles_needed
+from src.utils.time_utils import estimate_candles_needed, ensure_utc
 from src.config.params import ACCUMULATION_PARAMS
 
 logger = logging.getLogger(__name__)
@@ -157,12 +157,13 @@ class SymbolTrader:
         logger.info(f"[{self.symbol}] 📍 Обнаружено зон накопления: {len(zones)}")
         
         if zones:
-            # Log details of newest zones
-            for i, zone in enumerate(zones[:3]):  # Show first 3 zones
-                zone_id = zone.get('zone_id', i)
-                zone_high = zone.get('high', 0)
-                zone_low = zone.get('low', 0)
-                logger.info(f"[{self.symbol}]    Зона #{zone_id}: ${zone_low:.2f} - ${zone_high:.2f}")
+            # Log details of the newest zone only
+            newest_zone = max(zones, key=lambda z: ensure_utc(z.get('end')))
+            zone_id = newest_zone.get('zone_id', -1)
+            zone_high = newest_zone.get('high', 0)
+            zone_low = newest_zone.get('low', 0)
+            zone_end = newest_zone.get('end')
+            logger.info(f"[{self.symbol}]    Последняя зона #{zone_id}: ${zone_low:.2f} - ${zone_high:.2f} | Окончание: {zone_end}")
         
         return zones
     
