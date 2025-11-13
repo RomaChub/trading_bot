@@ -1205,7 +1205,8 @@ def trade_symbol(symbol: str, args, exec_client, total_balance, use_trailing, dr
 									import traceback
 									traceback.print_exc()
 									return False
-							
+
+
 							# Запускаем в отдельном потоке, но ждем результат (с таймаутом)
 							try:
 								position_future = executor.submit(_open_position_and_orders)
