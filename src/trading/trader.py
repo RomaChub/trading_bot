@@ -33,8 +33,14 @@ class SymbolTrader:
         self.telegram_notifier = telegram_notifier
         
         # Initialize components
+        # State
+        self.zones = []
+        self.trailing_task = None
+        self.trailing_status = {}
+        self.notification_sent = {}
+        
         self.position_manager = PositionManager(
-            exec_client, symbol, dry_run, telegram_notifier
+            exec_client, symbol, dry_run, telegram_notifier, self.notification_sent
         )
         self.position_manager.trader = self  # Link to trader for zone management
         self.breakout_detector = BreakoutDetector(
@@ -55,11 +61,6 @@ class SymbolTrader:
             symbol, args.interval, args.lookback_days
         )
         
-        # State
-        self.zones = []
-        self.trailing_task = None
-        self.trailing_status = {}
-        self.notification_sent = {}
         self._running = False
         self.current_zone_id = None  # ID зоны текущей открытой позиции
     

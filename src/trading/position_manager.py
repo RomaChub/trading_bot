@@ -22,11 +22,12 @@ class PositionManager:
     """Manages trading positions"""
     
     def __init__(self, exec_client, symbol: str, dry_run: bool = False,
-                 telegram_notifier=None):
+                 telegram_notifier=None, notification_sent_dict: Optional[Dict] = None):
         self.exec_client = exec_client
         self.symbol = symbol
         self.dry_run = dry_run
         self.telegram_notifier = telegram_notifier
+        self.notification_sent_dict = notification_sent_dict or {}
         self.current_position: Optional[PositionInfo] = None
         self._last_has_position = False
     
@@ -49,6 +50,41 @@ class PositionManager:
         positions = await self.get_open_positions()
         return any(abs(float(p.get("positionAmt", 0))) > 0 for p in positions)
     
+    async def verify_position_closed(self, max_attempts: int = 3, delay: float = 1.0) -> bool:
+        """
+        Verify that position is really closed by checking multiple times.
+        Returns True only if position is confirmed closed after all checks.
+        
+        Args:
+            max_attempts: Number of verification attempts
+            delay: Delay between attempts in seconds
+        """
+        logger.info(f"[{self.symbol}] 🔍 Проверка реального закрытия позиции (попыток: {max_attempts})...")
+        
+        for attempt in range(1, max_attempts + 1):
+            has_pos = await self.has_position()
+            
+            if has_pos:
+                logger.warning(f"[{self.symbol}] ⚠️ Позиция всё ещё открыта (попытка {attempt}/{max_attempts})")
+                if attempt < max_attempts:
+                    await asyncio.sleep(delay)
+                    continue
+                else:
+                    logger.error(f"[{self.symbol}] ❌ Позиция не закрыта после {max_attempts} проверок!")
+                    return False
+            else:
+                logger.info(f"[{self.symbol}] ✅ Позиция закрыта (попытка {attempt}/{max_attempts})")
+                if attempt < max_attempts:
+                    # Double-check after a short delay
+                    await asyncio.sleep(delay)
+                    continue
+                else:
+                    logger.info(f"[{self.symbol}] ✅ Позиция подтверждена закрытой после {max_attempts} проверок")
+                    return True
+        
+        # If we get here, all checks passed
+        return True
+    
     async def check_position_closed(self) -> bool:
         """Check if position was closed and handle cleanup"""
         has_pos = await self.has_position()
@@ -64,7 +100,16 @@ class PositionManager:
     
     async def _handle_position_closed(self):
         """Handle position closure - cleanup and notify"""
-        logger.info(f"[{self.symbol}] 🔄 Position closed. Cleaning up...")
+        logger.info(f"[{self.symbol}] 🔄 Обнаружено возможное закрытие позиции. Проверяем...")
+        
+        # Verify that position is really closed before cleaning up
+        is_closed = await self.verify_position_closed(max_attempts=3, delay=1.0)
+        
+        if not is_closed:
+            logger.warning(f"[{self.symbol}] ⚠️ Позиция не закрыта! Пропускаем очистку стопов и тейков.")
+            return
+        
+        logger.info(f"[{self.symbol}] ✅ Позиция подтверждена закрытой. Очистка...")
         
         # Release zone for re-trading (allows re-entry after false breakouts)
         if hasattr(self, 'trader') and self.trader and self.trader.current_zone_id is not None:
@@ -72,38 +117,45 @@ class PositionManager:
             self.trader.current_zone_id = None
             logger.info(f"[{self.symbol}] 🔓 Зона #{old_zone} снова доступна для торговли")
         
-        # Cancel orders
+        # Cancel orders only after confirming position is closed
         try:
             await asyncio.wait_for(
                 asyncio.to_thread(self.exec_client.cancel_all_conditional_orders, self.symbol),
                 timeout=5.0
             )
+            logger.info(f"[{self.symbol}] ✅ Условные ордера (стопы/тейки) удалены")
         except Exception as e:
             logger.warning(f"[{self.symbol}] ⚠️ Error cancelling orders: {e}")
         
         # Notify if we have position info
+        # Check if notification was already sent by TrailingStopManager
         if self.telegram_notifier and self.current_position:
-            try:
-                current_price = await self._get_current_price()
-                
-                if self.current_position.direction == "LONG":
-                    pnl = (current_price - self.current_position.entry_price) * self.current_position.quantity
-                else:
-                    pnl = (self.current_position.entry_price - current_price) * self.current_position.quantity
-                
-                self.telegram_notifier.notify_position_closed(
-                    symbol=self.symbol,
-                    direction=self.current_position.direction,
-                    entry_price=self.current_position.entry_price,
-                    exit_price=current_price,
-                    quantity=self.current_position.quantity,
-                    pnl=pnl,
-                    by_trailing=False,
-                    reason="Take Profit" if pnl > 0 else "Stop Loss"
-                )
-                logger.info(f"[{self.symbol}] ✅ Position close notification sent")
-            except Exception as e:
-                logger.warning(f"[{self.symbol}] ⚠️ Failed to send notification: {e}")
+            # Skip notification if it was already sent by TrailingStopManager
+            if self.notification_sent_dict.get(self.symbol, False):
+                logger.info(f"[{self.symbol}] ℹ️ Уведомление уже отправлено через TrailingStopManager, пропускаем")
+            else:
+                try:
+                    current_price = await self._get_current_price()
+                    
+                    if self.current_position.direction == "LONG":
+                        pnl = (current_price - self.current_position.entry_price) * self.current_position.quantity
+                    else:
+                        pnl = (self.current_position.entry_price - current_price) * self.current_position.quantity
+                    
+                    self.telegram_notifier.notify_position_closed(
+                        symbol=self.symbol,
+                        direction=self.current_position.direction,
+                        entry_price=self.current_position.entry_price,
+                        exit_price=current_price,
+                        quantity=self.current_position.quantity,
+                        pnl=pnl,
+                        by_trailing=False,
+                        reason="Take Profit" if pnl > 0 else "Stop Loss"
+                    )
+                    self.notification_sent_dict[self.symbol] = True
+                    logger.info(f"[{self.symbol}] ✅ Position close notification sent")
+                except Exception as e:
+                    logger.warning(f"[{self.symbol}] ⚠️ Failed to send notification: {e}")
         
         self.current_position = None
     
@@ -173,6 +225,9 @@ class PositionManager:
                 take_profit=take_profit,
                 zone_id=zone_id
             )
+            
+            # Reset notification flag for new position
+            self.notification_sent_dict[self.symbol] = False
             
             # Notify Telegram
             if self.telegram_notifier:

@@ -69,6 +69,41 @@ class TrailingStopManager:
             logger.warning(f"[Trailing] ⚠️ Error checking position: {e}")
             return True
     
+    async def verify_position_closed(self, max_attempts: int = 3, delay: float = 1.0) -> bool:
+        """
+        Verify that position is really closed by checking multiple times.
+        Returns True only if position is confirmed closed after all checks.
+        
+        Args:
+            max_attempts: Number of verification attempts
+            delay: Delay between attempts in seconds
+        """
+        logger.info(f"[Trailing] 🔍 Проверка реального закрытия позиции (попыток: {max_attempts})...")
+        
+        for attempt in range(1, max_attempts + 1):
+            has_pos = await self.check_position_exists()
+            
+            if has_pos:
+                logger.warning(f"[Trailing] ⚠️ Позиция всё ещё открыта (попытка {attempt}/{max_attempts})")
+                if attempt < max_attempts:
+                    await asyncio.sleep(delay)
+                    continue
+                else:
+                    logger.error(f"[Trailing] ❌ Позиция не закрыта после {max_attempts} проверок!")
+                    return False
+            else:
+                logger.info(f"[Trailing] ✅ Позиция закрыта (попытка {attempt}/{max_attempts})")
+                if attempt < max_attempts:
+                    # Double-check after a short delay
+                    await asyncio.sleep(delay)
+                    continue
+                else:
+                    logger.info(f"[Trailing] ✅ Позиция подтверждена закрытой после {max_attempts} проверок")
+                    return True
+        
+        # If we get here, all checks passed
+        return True
+    
     async def get_latest_kline(self):
         """Fetch latest candle data"""
         try:
@@ -213,7 +248,16 @@ class TrailingStopManager:
     
     async def handle_position_closed(self):
         """Handle position closure - cleanup and notify"""
-        logger.info("[Trailing] Position closed. Cleaning up...")
+        logger.info("[Trailing] Обнаружено возможное закрытие позиции. Проверяем...")
+        
+        # Verify that position is really closed before cleaning up
+        is_closed = await self.verify_position_closed(max_attempts=3, delay=1.0)
+        
+        if not is_closed:
+            logger.warning("[Trailing] ⚠️ Позиция не закрыта! Пропускаем очистку стопов и тейков.")
+            return
+        
+        logger.info("[Trailing] ✅ Позиция подтверждена закрытой. Очистка...")
         
         # Get exit price
         exit_price = await self._get_exit_price()
@@ -229,29 +273,34 @@ class TrailingStopManager:
         reason = "Trailing Stop" if by_trailing else ("Take Profit" if pnl > 0 else "Stop Loss")
         
         # Send notification
+        # Check if notification was already sent by PositionManager
         if self.telegram_notifier:
-            try:
-                self.telegram_notifier.notify_position_closed(
-                    symbol=self.symbol,
-                    direction=self.direction,
-                    entry_price=self.entry_price,
-                    exit_price=exit_price,
-                    quantity=self.position_qty,
-                    pnl=pnl,
-                    by_trailing=by_trailing,
-                    reason=reason
-                )
-                self.notification_sent_dict[self.symbol] = True
-                logger.info(f"[Trailing] ✅ Notification sent (Exit: ${exit_price:.2f}, P&L: ${pnl:.2f})")
-            except Exception as e:
-                logger.warning(f"[Trailing] ⚠️ Failed to send notification: {e}")
+            if self.notification_sent_dict.get(self.symbol, False):
+                logger.info("[Trailing] ℹ️ Уведомление уже отправлено через PositionManager, пропускаем")
+            else:
+                try:
+                    self.telegram_notifier.notify_position_closed(
+                        symbol=self.symbol,
+                        direction=self.direction,
+                        entry_price=self.entry_price,
+                        exit_price=exit_price,
+                        quantity=self.position_qty,
+                        pnl=pnl,
+                        by_trailing=by_trailing,
+                        reason=reason
+                    )
+                    self.notification_sent_dict[self.symbol] = True
+                    logger.info(f"[Trailing] ✅ Notification sent (Exit: ${exit_price:.2f}, P&L: ${pnl:.2f})")
+                except Exception as e:
+                    logger.warning(f"[Trailing] ⚠️ Failed to send notification: {e}")
         
-        # Cleanup orders
+        # Cleanup orders only after confirming position is closed
         try:
             await asyncio.wait_for(
                 asyncio.to_thread(self.exec_client.cancel_all_conditional_orders, self.symbol),
                 timeout=5.0
             )
+            logger.info("[Trailing] ✅ Условные ордера (стопы/тейки) удалены")
         except Exception as e:
             logger.warning(f"[Trailing] ⚠️ Error cancelling orders: {e}")
     
