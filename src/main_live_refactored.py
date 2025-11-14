@@ -148,13 +148,13 @@ def main():
     parser.add_argument(
         "--update_interval",
         type=int,
-        default=5,
+        default=10,
         help="Seconds between updates"
     )
     parser.add_argument(
         "--data_refresh_interval",
         type=int,
-        default=5,
+        default=10,
         help="Seconds between data refreshes"
     )
     
