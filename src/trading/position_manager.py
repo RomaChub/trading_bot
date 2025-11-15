@@ -64,6 +64,14 @@ class PositionManager:
         for attempt in range(1, max_attempts + 1):
             has_pos = await self.has_position()
             
+            # Get detailed position info for logging
+            positions = await self.get_open_positions()
+            if positions:
+                pos_details = []
+                for p in positions:
+                    pos_details.append(f"{p.get('symbol', 'N/A')}: {p.get('positionAmt', 0)} @ ${p.get('entryPrice', 0):.2f}")
+                logger.info(f"[{self.symbol}] Детали позиций: {', '.join(pos_details)}")
+            
             if has_pos:
                 logger.warning(f"[{self.symbol}] ⚠️ Позиция всё ещё открыта (попытка {attempt}/{max_attempts})")
                 if attempt < max_attempts:
@@ -103,10 +111,20 @@ class PositionManager:
         logger.info(f"[{self.symbol}] 🔄 Обнаружено возможное закрытие позиции. Проверяем...")
         
         # Verify that position is really closed before cleaning up
-        is_closed = await self.verify_position_closed(max_attempts=3, delay=1.0)
+        is_closed = await self.verify_position_closed(max_attempts=5, delay=1.5)
         
         if not is_closed:
             logger.warning(f"[{self.symbol}] ⚠️ Позиция не закрыта! Пропускаем очистку стопов и тейков.")
+            # Reset the flag to avoid false positives
+            self._last_has_position = await self.has_position()
+            return
+        
+        # Double-check one more time before sending notification
+        await asyncio.sleep(0.5)
+        final_check = await self.has_position()
+        if final_check:
+            logger.warning(f"[{self.symbol}] ⚠️ Позиция всё ещё открыта после финальной проверки! Пропускаем уведомление.")
+            self._last_has_position = True
             return
         
         logger.info(f"[{self.symbol}] ✅ Позиция подтверждена закрытой. Очистка...")
@@ -117,23 +135,23 @@ class PositionManager:
             self.trader.current_zone_id = None
             logger.info(f"[{self.symbol}] 🔓 Зона #{old_zone} снова доступна для торговли")
         
-        # Cancel orders only after confirming position is closed
-        try:
-            await asyncio.wait_for(
-                asyncio.to_thread(self.exec_client.cancel_all_conditional_orders, self.symbol),
-                timeout=5.0
-            )
-            logger.info(f"[{self.symbol}] ✅ Условные ордера (стопы/тейки) удалены")
-        except Exception as e:
-            logger.warning(f"[{self.symbol}] ⚠️ Error cancelling orders: {e}")
-        
         # Notify if we have position info
         # Check if notification was already sent by TrailingStopManager
+        notification_sent = False
         if self.telegram_notifier and self.current_position:
             # Skip notification if it was already sent by TrailingStopManager
             if self.notification_sent_dict.get(self.symbol, False):
                 logger.info(f"[{self.symbol}] ℹ️ Уведомление уже отправлено через TrailingStopManager, пропускаем")
+                notification_sent = True
             else:
+                # Final verification before sending notification
+                await asyncio.sleep(0.5)
+                last_check = await self.has_position()
+                if last_check:
+                    logger.error(f"[{self.symbol}] ❌ Позиция открыта перед отправкой уведомления! Отменяем уведомление и НЕ удаляем ордера.")
+                    self._last_has_position = True
+                    return
+                
                 try:
                     current_price = await self._get_current_price()
                     
@@ -153,9 +171,40 @@ class PositionManager:
                         reason="Take Profit" if pnl > 0 else "Stop Loss"
                     )
                     self.notification_sent_dict[self.symbol] = True
+                    notification_sent = True
                     logger.info(f"[{self.symbol}] ✅ Position close notification sent")
+                    
+                    # Verify position is still closed after notification
+                    await asyncio.sleep(1.0)
+                    post_notification_check = await self.has_position()
+                    if post_notification_check:
+                        logger.error(f"[{self.symbol}] ❌ КРИТИЧЕСКАЯ ОШИБКА: Позиция открыта ПОСЛЕ отправки уведомления! Позиция не была закрыта. НЕ удаляем ордера.")
+                        self._last_has_position = True
+                        return
                 except Exception as e:
                     logger.warning(f"[{self.symbol}] ⚠️ Failed to send notification: {e}")
+        
+        # Cancel orders ONLY after all checks passed and notification sent (if needed)
+        # This ensures we don't remove protection orders if position is still open
+        if notification_sent or not (self.telegram_notifier and self.current_position):
+            # Final check before canceling orders
+            await asyncio.sleep(0.5)
+            final_order_check = await self.has_position()
+            if final_order_check:
+                logger.error(f"[{self.symbol}] ❌ Позиция открыта перед удалением ордеров! НЕ удаляем ордера.")
+                self._last_has_position = True
+                return
+            
+            try:
+                await asyncio.wait_for(
+                    asyncio.to_thread(self.exec_client.cancel_all_conditional_orders, self.symbol),
+                    timeout=5.0
+                )
+                logger.info(f"[{self.symbol}] ✅ Условные ордера (стопы/тейки) удалены")
+            except Exception as e:
+                logger.warning(f"[{self.symbol}] ⚠️ Error cancelling orders: {e}")
+        else:
+            logger.warning(f"[{self.symbol}] ⚠️ Уведомление не отправлено, пропускаем удаление ордеров для безопасности")
         
         self.current_position = None
     
