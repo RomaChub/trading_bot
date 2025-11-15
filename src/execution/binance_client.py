@@ -153,6 +153,10 @@ class BinanceFuturesExecutor:
 		if self.dry_run:
 			return []
 		try:
+			# Rate limit before making request
+			if not self.dry_run:
+				self._rate_limiter.wait_if_needed()
+			
 			positions = self.client.futures_position_information(symbol=symbol) if symbol else self.client.futures_position_information()
 			open_positions = []
 			for pos in positions:
@@ -298,6 +302,9 @@ class BinanceFuturesExecutor:
 	def close_position(self, symbol: str) -> Dict[str, Any]:
 		if self.dry_run:
 			return {"dry_run": True, "action": "close_position", "symbol": symbol}
+		
+		# Rate limit before making request
+		self._rate_limiter.wait_if_needed()
 		positions = self.client.futures_position_information(symbol=symbol)
 		resp = {"responses": []}
 		position_mode = self.get_position_mode()
@@ -323,6 +330,8 @@ class BinanceFuturesExecutor:
 				if position_mode == "Hedge":
 					order_params["positionSide"] = "SHORT"
 			
+			# Rate limit before creating order
+			self._rate_limiter.wait_if_needed()
 			order = self.client.futures_create_order(**order_params)
 			resp["responses"].append(order)
 		return resp

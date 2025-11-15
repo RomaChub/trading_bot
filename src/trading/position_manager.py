@@ -50,30 +50,30 @@ class PositionManager:
         positions = await self.get_open_positions()
         return any(abs(float(p.get("positionAmt", 0))) > 0 for p in positions)
     
-    async def verify_position_closed(self, max_attempts: int = 3, delay: float = 1.0) -> bool:
+    async def verify_position_closed(self, max_attempts: int = 3, delay: float = 2.0) -> bool:
         """
         Verify that position is really closed by checking multiple times.
         Returns True only if position is confirmed closed after all checks.
+        Optimized to reduce API calls.
         
         Args:
-            max_attempts: Number of verification attempts
-            delay: Delay between attempts in seconds
+            max_attempts: Number of verification attempts (default: 3 to reduce API calls)
+            delay: Delay between attempts in seconds (default: 2.0 to reduce rate limit pressure)
         """
-        logger.info(f"[{self.symbol}] 🔍 Проверка реального закрытия позиции (попыток: {max_attempts})...")
+        logger.info(f"[{self.symbol}] 🔍 Проверка реального закрытия позиции (попыток: {max_attempts}, задержка: {delay}с)...")
         
+        positions_cache = None
         for attempt in range(1, max_attempts + 1):
-            has_pos = await self.has_position()
+            # Single API call - get positions once and use for both check and logging
+            positions_cache = await self.get_open_positions()
+            has_pos = any(abs(float(p.get("positionAmt", 0))) > 0 for p in positions_cache)
             
-            # Get detailed position info for logging
-            positions = await self.get_open_positions()
-            if positions:
+            # Log details only if position exists (to reduce log spam)
+            if has_pos and positions_cache:
                 pos_details = []
-                for p in positions:
+                for p in positions_cache:
                     pos_details.append(f"{p.get('symbol', 'N/A')}: {p.get('positionAmt', 0)} @ ${p.get('entryPrice', 0):.2f}")
-                logger.info(f"[{self.symbol}] Детали позиций: {', '.join(pos_details)}")
-            
-            if has_pos:
-                logger.warning(f"[{self.symbol}] ⚠️ Позиция всё ещё открыта (попытка {attempt}/{max_attempts})")
+                logger.warning(f"[{self.symbol}] ⚠️ Позиция всё ещё открыта (попытка {attempt}/{max_attempts}): {', '.join(pos_details)}")
                 if attempt < max_attempts:
                     await asyncio.sleep(delay)
                     continue
@@ -83,7 +83,7 @@ class PositionManager:
             else:
                 logger.info(f"[{self.symbol}] ✅ Позиция закрыта (попытка {attempt}/{max_attempts})")
                 if attempt < max_attempts:
-                    # Double-check after a short delay
+                    # Double-check after a delay
                     await asyncio.sleep(delay)
                     continue
                 else:
@@ -111,21 +111,17 @@ class PositionManager:
         logger.info(f"[{self.symbol}] 🔄 Обнаружено возможное закрытие позиции. Проверяем...")
         
         # Verify that position is really closed before cleaning up
-        is_closed = await self.verify_position_closed(max_attempts=5, delay=1.5)
+        # Reduced attempts and increased delay to reduce API calls
+        is_closed = await self.verify_position_closed(max_attempts=3, delay=2.0)
         
         if not is_closed:
             logger.warning(f"[{self.symbol}] ⚠️ Позиция не закрыта! Пропускаем очистку стопов и тейков.")
-            # Reset the flag to avoid false positives
-            self._last_has_position = await self.has_position()
-            return
-        
-        # Double-check one more time before sending notification
-        await asyncio.sleep(0.5)
-        final_check = await self.has_position()
-        if final_check:
-            logger.warning(f"[{self.symbol}] ⚠️ Позиция всё ещё открыта после финальной проверки! Пропускаем уведомление.")
+            # Reset the flag to avoid false positives (reuse last check from verify_position_closed)
             self._last_has_position = True
             return
+        
+        # Skip additional check - verify_position_closed already did multiple checks
+        # This saves one API call
         
         logger.info(f"[{self.symbol}] ✅ Позиция подтверждена закрытой. Очистка...")
         
@@ -144,14 +140,8 @@ class PositionManager:
                 logger.info(f"[{self.symbol}] ℹ️ Уведомление уже отправлено через TrailingStopManager, пропускаем")
                 notification_sent = True
             else:
-                # Final verification before sending notification
-                await asyncio.sleep(0.5)
-                last_check = await self.has_position()
-                if last_check:
-                    logger.error(f"[{self.symbol}] ❌ Позиция открыта перед отправкой уведомления! Отменяем уведомление и НЕ удаляем ордера.")
-                    self._last_has_position = True
-                    return
-                
+                # Skip additional check - verify_position_closed already verified multiple times
+                # This saves API calls
                 try:
                     current_price = await self._get_current_price()
                     
@@ -174,27 +164,15 @@ class PositionManager:
                     notification_sent = True
                     logger.info(f"[{self.symbol}] ✅ Position close notification sent")
                     
-                    # Verify position is still closed after notification
-                    await asyncio.sleep(1.0)
-                    post_notification_check = await self.has_position()
-                    if post_notification_check:
-                        logger.error(f"[{self.symbol}] ❌ КРИТИЧЕСКАЯ ОШИБКА: Позиция открыта ПОСЛЕ отправки уведомления! Позиция не была закрыта. НЕ удаляем ордера.")
-                        self._last_has_position = True
-                        return
+                    # Skip post-notification check to save API calls
+                    # verify_position_closed already did thorough checking
                 except Exception as e:
                     logger.warning(f"[{self.symbol}] ⚠️ Failed to send notification: {e}")
         
         # Cancel orders ONLY after all checks passed and notification sent (if needed)
         # This ensures we don't remove protection orders if position is still open
+        # Skip final check to save API calls - verify_position_closed already verified
         if notification_sent or not (self.telegram_notifier and self.current_position):
-            # Final check before canceling orders
-            await asyncio.sleep(0.5)
-            final_order_check = await self.has_position()
-            if final_order_check:
-                logger.error(f"[{self.symbol}] ❌ Позиция открыта перед удалением ордеров! НЕ удаляем ордера.")
-                self._last_has_position = True
-                return
-            
             try:
                 await asyncio.wait_for(
                     asyncio.to_thread(self.exec_client.cancel_all_conditional_orders, self.symbol),

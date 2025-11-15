@@ -14,13 +14,13 @@ class RateLimiter:
     We'll use a conservative limit of 35 requests per second to stay safe.
     """
     
-    def __init__(self, max_requests_per_second: float = 35.0, max_requests_per_minute: int = 2300):
+    def __init__(self, max_requests_per_second: float = 35.0, max_requests_per_minute: int = 2100):
         """
         Initialize rate limiter.
         
         Args:
             max_requests_per_second: Maximum requests per second (default: 35)
-            max_requests_per_minute: Maximum requests per minute (default: 2300, conservative)
+            max_requests_per_minute: Maximum requests per minute (default: 2100, Binance limit)
         """
         self.max_rps = max_requests_per_second
         self.max_rpm = max_requests_per_minute
