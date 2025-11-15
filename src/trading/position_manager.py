@@ -160,13 +160,13 @@ class PositionManager:
         self.current_position = None
     
     async def _get_current_price(self) -> float:
-        """Get current market price"""
+        """Get current market price with caching"""
         try:
-            ticker = await asyncio.wait_for(
-                asyncio.to_thread(self.exec_client.client.futures_symbol_ticker, symbol=self.symbol),
+            price = await asyncio.wait_for(
+                asyncio.to_thread(self.exec_client.get_ticker_price, self.symbol, use_cache=True),
                 timeout=3.0
             )
-            return float(ticker['price'])
+            return price if price is not None else 0.0
         except Exception as e:
             logger.warning(f"[{self.symbol}] ⚠️ Error getting price: {e}")
             return 0.0

@@ -305,19 +305,19 @@ class TrailingStopManager:
             logger.warning(f"[Trailing] ⚠️ Error cancelling orders: {e}")
     
     async def _get_exit_price(self) -> float:
-        """Get current price as exit price"""
+        """Get current price as exit price with caching"""
         try:
-            ticker = await asyncio.wait_for(
-                asyncio.to_thread(self.exec_client.client.futures_symbol_ticker, symbol=self.symbol),
+            price = await asyncio.wait_for(
+                asyncio.to_thread(self.exec_client.get_ticker_price, self.symbol, use_cache=True),
                 timeout=3.0
             )
-            return float(ticker['price'])
+            return price if price is not None else self.entry_price
         except Exception as e:
             logger.warning(f"[Trailing] ⚠️ Error getting exit price: {e}")
             return self.entry_price
     
-    async def run(self, update_interval: int = 5):
-        """Main trailing stop loop"""
+    async def run(self, update_interval: int = 15):
+        """Main trailing stop loop (default interval increased to reduce API calls)"""
         try:
             while not self._stopped:
                 # Check if position exists
@@ -325,7 +325,7 @@ class TrailingStopManager:
                     await self.handle_position_closed()
                     break
                 
-                # Get latest candle
+                # Get latest candle (with rate limiting)
                 candle = await self.get_latest_kline()
                 if not candle:
                     await asyncio.sleep(update_interval)

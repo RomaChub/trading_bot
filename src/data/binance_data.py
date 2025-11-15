@@ -9,6 +9,7 @@ from binance.client import Client
 from requests.exceptions import ConnectionError
 
 from src.config.settings import DATA_CACHE_DIR
+from src.utils.rate_limiter import get_rate_limiter
 
 
 class BinanceDataLoader:
@@ -18,6 +19,7 @@ class BinanceDataLoader:
 		self.lookback_days = lookback_days
 		self.client = Client(api_key, api_secret)
 		self.df: Optional[pd.DataFrame] = None
+		self._rate_limiter = get_rate_limiter()
 
 	@property
 	def cache_path(self) -> str:
@@ -52,6 +54,9 @@ class BinanceDataLoader:
 			current_end = min(current_start + timedelta(days=chunk_days), end_date)
 			print(f"  Chunk: {current_start:%Y-%m-%d %H:%M} -> {current_end:%Y-%m-%d %H:%M}")
 			try:
+				# Rate limit before making request
+				self._rate_limiter.wait_if_needed()
+				
 				klines = self.client.get_historical_klines(
 					self.symbol,
 					self.interval,
@@ -147,14 +152,25 @@ class BinanceDataLoader:
 		"""Fetch latest futures klines and keep dataframe up to lookback window."""
 		for attempt in range(3):
 			try:
+				# Rate limit before making request
+				self._rate_limiter.wait_if_needed()
+				
 				klines = self.client.futures_klines(symbol=self.symbol, interval=self.interval, limit=limit)
 				break
 			except (ConnectionError, Exception) as e:
+				error_str = str(e)
+				# Check if it's a rate limit error
+				if "Too many requests" in error_str or "-1003" in error_str:
+					wait_time = 5.0  # Wait longer for rate limit
+					print(f"[LIVE DATA] ⚠️ Rate limit exceeded (attempt {attempt + 1}/3), waiting {wait_time} seconds...")
+					time.sleep(wait_time)
+					if attempt < 2:
+						continue
+				
 				if attempt < 2:
 					wait_time = (attempt + 1) * 2
 					print(f"[LIVE DATA] ⚠️ Error fetching klines (attempt {attempt + 1}/3): {e}")
 					print(f"[LIVE DATA] Retrying in {wait_time} seconds...")
-					import time
 					time.sleep(wait_time)
 				else:
 					print(f"[LIVE DATA] ❌ Failed to fetch latest klines after 3 attempts: {e}")

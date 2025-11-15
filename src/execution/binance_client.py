@@ -14,6 +14,7 @@ from src.execution.filters import (
 	format_quantity_str,
 	format_price_str,
 )
+from src.utils.rate_limiter import get_rate_limiter
 
 
 class BinanceFuturesExecutor:
@@ -22,6 +23,9 @@ class BinanceFuturesExecutor:
 		self.api_secret = api_secret or BINANCE_API_SECRET
 		self.dry_run = dry_run
 		self._filters_cache: Dict[str, Dict[str, Any]] = {}  # Cache for symbol filters
+		self._ticker_cache: Dict[str, tuple] = {}  # Cache for ticker: {symbol: (price, timestamp)}
+		self._ticker_cache_ttl = 1.0  # Cache ticker for 1 second
+		self._rate_limiter = get_rate_limiter()
 		
 		# Debug: Check if API keys are loaded
 		if not self.api_key or not self.api_secret:
@@ -482,9 +486,46 @@ class BinanceFuturesExecutor:
 		self.cancel_stop_orders(symbol)
 		return self.place_stop_loss(symbol, side=side, quantity=quantity, stop_price=new_stop)
 
+	def get_ticker_price(self, symbol: str, use_cache: bool = True) -> Optional[float]:
+		"""
+		Get current ticker price with caching and rate limiting.
+		
+		Args:
+			symbol: Trading symbol
+			use_cache: Whether to use cached price (default: True)
+		
+		Returns:
+			Current price or None if error
+		"""
+		current_time = time.time()
+		
+		# Check cache
+		if use_cache and symbol in self._ticker_cache:
+			cached_price, cache_time = self._ticker_cache[symbol]
+			if current_time - cache_time < self._ticker_cache_ttl:
+				return cached_price
+		
+		# Rate limit before making request
+		if not self.dry_run:
+			self._rate_limiter.wait_if_needed()
+		
+		try:
+			ticker = self.client.futures_symbol_ticker(symbol=symbol)
+			price = float(ticker['price'])
+			
+			# Update cache
+			self._ticker_cache[symbol] = (price, current_time)
+			return price
+		except Exception as e:
+			print(f"[ERROR] Error getting ticker price for {symbol}: {e}")
+			# Return cached price if available, even if expired
+			if symbol in self._ticker_cache:
+				return self._ticker_cache[symbol][0]
+			return None
+	
 	def fetch_recent_klines(self, symbol: str, interval: str, limit: int = 2, max_retries: int = 3):
 		"""
-		Fetch recent klines with retry logic for timeout errors.
+		Fetch recent klines with retry logic for timeout errors and rate limiting.
 		
 		Args:
 			symbol: Trading symbol
@@ -497,6 +538,10 @@ class BinanceFuturesExecutor:
 		"""
 		for attempt in range(max_retries):
 			try:
+				# Rate limit before making request
+				if not self.dry_run:
+					self._rate_limiter.wait_if_needed()
+				
 				return self.client.futures_klines(symbol=symbol, interval=interval, limit=limit)
 			except (ReadTimeout, ConnectionError) as e:
 				if attempt < max_retries - 1:
@@ -508,6 +553,15 @@ class BinanceFuturesExecutor:
 					print(f"[ERROR] Failed to fetch klines after {max_retries} attempts: {e}")
 					return None
 			except Exception as e:
+				# Check if it's a rate limit error
+				error_str = str(e)
+				if "Too many requests" in error_str or "-1003" in error_str:
+					# Rate limit exceeded - wait longer
+					wait_time = 5.0  # Wait 5 seconds for rate limit
+					print(f"[RATE LIMIT] Rate limit exceeded, waiting {wait_time} seconds...")
+					time.sleep(wait_time)
+					if attempt < max_retries - 1:
+						continue
 				print(f"[ERROR] Unexpected error fetching klines: {e}")
 				return None
 		return None

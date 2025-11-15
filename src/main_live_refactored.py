@@ -144,18 +144,18 @@ def main():
         help="Trailing buffer percentage"
     )
     
-    # Update intervals
+    # Update intervals (increased to reduce API calls)
     parser.add_argument(
         "--update_interval",
         type=int,
-        default=10,
-        help="Seconds between updates"
+        default=30,
+        help="Seconds between updates (default: 30 to stay within rate limits)"
     )
     parser.add_argument(
         "--data_refresh_interval",
         type=int,
-        default=10,
-        help="Seconds between data refreshes"
+        default=60,
+        help="Seconds between data refreshes (default: 60 to stay within rate limits)"
     )
     
     # Misc

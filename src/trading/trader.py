@@ -169,16 +169,17 @@ class SymbolTrader:
         return zones
     
     async def _get_current_price(self) -> float:
-        """Get current market price"""
+        """Get current market price with caching"""
         try:
-            ticker = await asyncio.wait_for(
+            price = await asyncio.wait_for(
                 asyncio.to_thread(
-                    self.exec_client.client.futures_symbol_ticker,
-                    symbol=self.symbol
+                    self.exec_client.get_ticker_price,
+                    self.symbol,
+                    use_cache=True
                 ),
                 timeout=5.0
             )
-            return float(ticker['price'])
+            return price if price is not None else 0.0
         except Exception as e:
             logger.warning(f"[{self.symbol}] ⚠️ Error getting price: {e}")
             return 0.0
@@ -211,16 +212,18 @@ class SymbolTrader:
                     await asyncio.sleep(update_interval)
                     continue
                 
-                # Check for breakouts
+                # Check for breakouts (less frequently to reduce API calls)
                 has_position = await self.position_manager.has_position()
                 if not has_position:
-                    await self._check_breakouts(current_time)
+                    # Check breakouts every 3rd iteration to reduce klines requests
+                    if iteration % 3 == 0:
+                        await self._check_breakouts(current_time)
                 else:
                     if iteration % 10 == 0:
                         zone_info = f" (зона #{self.current_zone_id})" if self.current_zone_id else ""
                         logger.info(f"[{self.symbol}] 📊 Позиция открыта{zone_info}, ожидание выхода...")
                 
-                # Refresh data periodically
+                # Refresh data periodically (less frequently to reduce API calls)
                 import time
                 now = time.time()
                 if now - last_data_refresh >= data_refresh_interval:
