@@ -60,3 +60,4 @@ def estimate_candles_needed(interval: str, lookback_days: int, max_limit: int = 
     needed = int(total_minutes / minutes_per_candle) + 5
     return max(10, min(max_limit, needed))
 
+

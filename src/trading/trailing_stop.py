@@ -353,11 +353,27 @@ class TrailingStopManager:
     async def run(self, update_interval: int = 15):
         """Main trailing stop loop (default interval increased to reduce API calls)"""
         try:
+            consecutive_not_found = 0  # Track consecutive "position not found" checks
+            max_consecutive_not_found = 3  # Only treat as closed after 3 consecutive failures
+            
             while not self._stopped:
-                # Check if position exists
-                if not await self.check_position_exists():
-                    await self.handle_position_closed()
-                    break
+                # Check if position exists (but don't immediately assume it's closed)
+                position_exists = await self.check_position_exists()
+                
+                if not position_exists:
+                    consecutive_not_found += 1
+                    # Only treat as closed after multiple consecutive failures
+                    # This prevents false positives during API delays or temporary issues
+                    if consecutive_not_found >= max_consecutive_not_found:
+                        logger.info(f"[Trailing] Позиция не найдена {consecutive_not_found} раз подряд, проверяем закрытие...")
+                        await self.handle_position_closed()
+                        break
+                    else:
+                        # Position not found, but might be temporary - continue with caution
+                        logger.debug(f"[Trailing] Позиция не найдена (попытка {consecutive_not_found}/{max_consecutive_not_found}), продолжаем...")
+                else:
+                    # Reset counter if position is found
+                    consecutive_not_found = 0
                 
                 # Get latest candle (with rate limiting)
                 candle = await self.get_latest_kline()
@@ -369,12 +385,16 @@ class TrailingStopManager:
                 low = float(candle[3])
                 close = float(candle[4])
                 
-                # Check activation
+                # Check activation (this just sets trailing_active flag, doesn't check position closure)
                 self.check_activation(high, low, close)
                 
                 # Calculate and update stop if needed
+                # When trailing activates, we just create a new stop at the new location
+                # No need to check if position is closed - it shouldn't be closed at activation
                 new_stop = self.calculate_new_stop(high, low)
                 if self.trailing_active:
+                    # Update stop loss - this creates a new stop order at the new location
+                    # Position should still be open at this point
                     await self.update_stop_loss(new_stop, close)
                 
             await asyncio.sleep(update_interval)
