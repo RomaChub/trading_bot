@@ -69,6 +69,9 @@ class TelegramNotifier:
 		self.enabled = bool(self.bot_token)
 		# Notifications are enabled only if we have both bot_token and chat_id
 		self.notifications_enabled = bool(self.bot_token and self.chat_id)
+		# Track processed position closures to prevent duplicates
+		self._processed_closures = {}  # symbol -> bool
+		self._closure_lock = threading.Lock()
 		
 		if not self.enabled:
 			print("⚠️ Telegram bot disabled: BOT_TOKEN not set")
@@ -252,6 +255,10 @@ class TelegramNotifier:
 	def notify_position_opened(self, symbol: str, direction: str, entry_price: float, 
 	                          quantity: float, stop_loss: float, take_profit: float, zone_id: int):
 		"""Notify about opened position"""
+		# Reset closure flag when opening new position
+		with self._closure_lock:
+			self._processed_closures[symbol] = False
+		
 		if not self.notifications_enabled:
 			return
 		message = f"""🚀 Позиция открыта
@@ -271,7 +278,15 @@ class TelegramNotifier:
 	                          exit_price: float, quantity: float, pnl: float, 
 	                          by_trailing: bool = False, reason: str = ""):
 		"""Notify about closed position"""
-		# Always update stats (even if notifications are disabled)
+		# Check if this position closure was already processed (thread-safe)
+		with self._closure_lock:
+			if self._processed_closures.get(symbol, False):
+				# Already processed, skip to prevent duplicate notifications and stats
+				return
+			# Mark as processed
+			self._processed_closures[symbol] = True
+		
+		# Update stats (only once per position closure)
 		is_win = pnl > 0
 		if is_win:
 			self.stats.add_win(by_trailing=by_trailing)
