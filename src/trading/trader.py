@@ -203,8 +203,11 @@ class SymbolTrader:
                 if iteration % 10 == 0:
                     logger.info(f"[{self.symbol}] 🔁 Цикл #{iteration} | Время: {current_time.strftime('%H:%M:%S')}")
                 
-                # Check if position closed
-                await self.position_manager.check_position_closed()
+                # Check if position closed (only when we have a position)
+                if self.position_manager.current_position:
+                    # Check every 5 iterations to reduce API calls
+                    if iteration % 5 == 0:
+                        await self.position_manager.check_position_closed()
                 
                 # Get current price
                 current_price = await self._get_current_price()

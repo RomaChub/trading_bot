@@ -29,7 +29,7 @@ class PositionManager:
         self.telegram_notifier = telegram_notifier
         self.notification_sent_dict = notification_sent_dict or {}
         self.current_position: Optional[PositionInfo] = None
-        self._last_has_position = False
+        self.trader = None  # Will be set by SymbolTrader
     
     async def get_open_positions(self):
         """Get open positions for symbol"""
@@ -50,140 +50,88 @@ class PositionManager:
         positions = await self.get_open_positions()
         return any(abs(float(p.get("positionAmt", 0))) > 0 for p in positions)
     
-    async def verify_position_closed(self, max_attempts: int = 3, delay: float = 2.0) -> bool:
-        """
-        Verify that position is really closed by checking multiple times.
-        Returns True only if position is confirmed closed after all checks.
-        Optimized to reduce API calls.
-        
-        Args:
-            max_attempts: Number of verification attempts (default: 3 to reduce API calls)
-            delay: Delay between attempts in seconds (default: 2.0 to reduce rate limit pressure)
-        """
-        logger.info(f"[{self.symbol}] 🔍 Проверка реального закрытия позиции (попыток: {max_attempts}, задержка: {delay}с)...")
-        
-        positions_cache = None
-        for attempt in range(1, max_attempts + 1):
-            # Single API call - get positions once and use for both check and logging
-            positions_cache = await self.get_open_positions()
-            has_pos = any(abs(float(p.get("positionAmt", 0))) > 0 for p in positions_cache)
-            
-            # Log details only if position exists (to reduce log spam)
-            if has_pos and positions_cache:
-                pos_details = []
-                for p in positions_cache:
-                    pos_details.append(f"{p.get('symbol', 'N/A')}: {p.get('positionAmt', 0)} @ ${p.get('entryPrice', 0):.2f}")
-                logger.warning(f"[{self.symbol}] ⚠️ Позиция всё ещё открыта (попытка {attempt}/{max_attempts}): {', '.join(pos_details)}")
-                if attempt < max_attempts:
-                    await asyncio.sleep(delay)
-                    continue
-                else:
-                    logger.error(f"[{self.symbol}] ❌ Позиция не закрыта после {max_attempts} проверок!")
-                    return False
-            else:
-                logger.info(f"[{self.symbol}] ✅ Позиция закрыта (попытка {attempt}/{max_attempts})")
-                if attempt < max_attempts:
-                    # Double-check after a delay
-                    await asyncio.sleep(delay)
-                    continue
-                else:
-                    logger.info(f"[{self.symbol}] ✅ Позиция подтверждена закрытой после {max_attempts} проверок")
-                    return True
-        
-        # If we get here, all checks passed
-        return True
     
     async def check_position_closed(self) -> bool:
-        """Check if position was closed and handle cleanup"""
+        """Check if position was closed and handle cleanup - only called when we suspect closure"""
+        # Simple check: is position really closed?
         has_pos = await self.has_position()
         
-        if self._last_has_position and not has_pos:
-            # Position closed
-            await self._handle_position_closed()
-            self._last_has_position = False
-            return True
+        if not has_pos and self.current_position:
+            # Position appears closed - verify once
+            logger.info(f"[{self.symbol}] 🔍 Проверяем закрытие позиции...")
+            
+            # Double check after short delay
+            await asyncio.sleep(1.0)
+            has_pos_again = await self.has_position()
+            
+            if not has_pos_again:
+                # Position is really closed
+                await self._handle_position_closed()
+                return True
         
-        self._last_has_position = has_pos
         return False
     
     async def _handle_position_closed(self):
         """Handle position closure - cleanup and notify"""
-        logger.info(f"[{self.symbol}] 🔄 Обнаружено возможное закрытие позиции. Проверяем...")
-        
-        # Verify that position is really closed before cleaning up
-        # Reduced attempts and increased delay to reduce API calls
-        is_closed = await self.verify_position_closed(max_attempts=3, delay=2.0)
-        
-        if not is_closed:
-            logger.warning(f"[{self.symbol}] ⚠️ Позиция не закрыта! Пропускаем очистку стопов и тейков.")
-            # Reset the flag to avoid false positives (reuse last check from verify_position_closed)
-            self._last_has_position = True
+        if not self.current_position:
             return
         
-        # Skip additional check - verify_position_closed already did multiple checks
-        # This saves one API call
+        logger.info(f"[{self.symbol}] ✅ Позиция закрыта. Очистка...")
         
-        logger.info(f"[{self.symbol}] ✅ Позиция подтверждена закрытой. Очистка...")
-        
-        # Release zone for re-trading (allows re-entry after false breakouts)
+        # Release zone for re-trading
         if hasattr(self, 'trader') and self.trader and self.trader.current_zone_id is not None:
             old_zone = self.trader.current_zone_id
             self.trader.current_zone_id = None
             logger.info(f"[{self.symbol}] 🔓 Зона #{old_zone} снова доступна для торговли")
         
-        # Notify if we have position info
-        # Check if notification was already sent by TrailingStopManager
-        notification_sent = False
-        if self.telegram_notifier and self.current_position:
-            # Skip notification if it was already sent by TrailingStopManager
-            if self.notification_sent_dict.get(self.symbol, False):
-                logger.info(f"[{self.symbol}] ℹ️ Уведомление уже отправлено через TrailingStopManager, пропускаем")
-                notification_sent = True
-            else:
-                # Skip additional check - verify_position_closed already verified multiple times
-                # This saves API calls
-                try:
-                    current_price = await self._get_current_price()
-                    
-                    if self.current_position.direction == "LONG":
-                        pnl = (current_price - self.current_position.entry_price) * self.current_position.quantity
-                    else:
-                        pnl = (self.current_position.entry_price - current_price) * self.current_position.quantity
-                    
-                    self.telegram_notifier.notify_position_closed(
-                        symbol=self.symbol,
-                        direction=self.current_position.direction,
-                        entry_price=self.current_position.entry_price,
-                        exit_price=current_price,
-                        quantity=self.current_position.quantity,
-                        pnl=pnl,
-                        by_trailing=False,
-                        reason="Take Profit" if pnl > 0 else "Stop Loss"
-                    )
-                    self.notification_sent_dict[self.symbol] = True
-                    notification_sent = True
-                    logger.info(f"[{self.symbol}] ✅ Position close notification sent")
-                    
-                    # Skip post-notification check to save API calls
-                    # verify_position_closed already did thorough checking
-                except Exception as e:
-                    logger.warning(f"[{self.symbol}] ⚠️ Failed to send notification: {e}")
-        
-        # Cancel orders ONLY after all checks passed and notification sent (if needed)
-        # This ensures we don't remove protection orders if position is still open
-        # Skip final check to save API calls - verify_position_closed already verified
-        if notification_sent or not (self.telegram_notifier and self.current_position):
-            try:
-                await asyncio.wait_for(
-                    asyncio.to_thread(self.exec_client.cancel_all_conditional_orders, self.symbol),
-                    timeout=5.0
-                )
-                logger.info(f"[{self.symbol}] ✅ Условные ордера (стопы/тейки) удалены")
-            except Exception as e:
-                logger.warning(f"[{self.symbol}] ⚠️ Error cancelling orders: {e}")
+        # Get exit price and calculate PnL
+        exit_price = await self._get_current_price()
+        if self.current_position.direction == "LONG":
+            pnl = (exit_price - self.current_position.entry_price) * self.current_position.quantity
         else:
-            logger.warning(f"[{self.symbol}] ⚠️ Уведомление не отправлено, пропускаем удаление ордеров для безопасности")
+            pnl = (self.current_position.entry_price - exit_price) * self.current_position.quantity
         
+        # Determine reason (check if trailing was active)
+        by_trailing = False
+        if hasattr(self, 'trader') and self.trader and hasattr(self.trader, 'trailing_status'):
+            by_trailing = self.trader.trailing_status.get(self.symbol, False)
+        reason = "Trailing Stop" if by_trailing else ("Take Profit" if pnl > 0 else "Stop Loss")
+        
+        # Send notification (only once)
+        if self.telegram_notifier and not self.notification_sent_dict.get(self.symbol, False):
+            try:
+                self.telegram_notifier.notify_position_closed(
+                    symbol=self.symbol,
+                    direction=self.current_position.direction,
+                    entry_price=self.current_position.entry_price,
+                    exit_price=exit_price,
+                    quantity=self.current_position.quantity,
+                    pnl=pnl,
+                    by_trailing=by_trailing,
+                    reason=reason
+                )
+                self.notification_sent_dict[self.symbol] = True
+                logger.info(f"[{self.symbol}] ✅ Уведомление о закрытии отправлено")
+            except Exception as e:
+                logger.warning(f"[{self.symbol}] ⚠️ Ошибка отправки уведомления: {e}")
+        
+        # Cancel remaining orders (only after position is confirmed closed)
+        try:
+            await asyncio.wait_for(
+                asyncio.to_thread(self.exec_client.cancel_all_conditional_orders, self.symbol),
+                timeout=5.0
+            )
+            logger.info(f"[{self.symbol}] ✅ Оставшиеся условные ордера удалены")
+        except Exception as e:
+            logger.warning(f"[{self.symbol}] ⚠️ Ошибка удаления ордеров: {e}")
+        
+        # Stop trailing stop task if it exists
+        if hasattr(self, 'trader') and self.trader and self.trader.trailing_task:
+            if not self.trader.trailing_task.done():
+                self.trader.trailing_task.cancel()
+                logger.info(f"[{self.symbol}] ✅ Trailing stop task остановлен")
+        
+        # Clear position
         self.current_position = None
     
     async def _get_current_price(self) -> float:

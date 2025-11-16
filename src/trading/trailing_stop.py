@@ -54,72 +54,6 @@ class TrailingStopManager:
         logger.info(f"[Trailing] Entry: ${entry_price:.2f}, Stop: ${initial_stop:.2f}, Risk: ${self.risk:.2f}")
         logger.info(f"[Trailing] Activation threshold: ${self.trail_threshold:.2f}")
     
-    async def check_position_exists(self) -> bool:
-        """Check if position still exists"""
-        try:
-            positions = await asyncio.wait_for(
-                asyncio.to_thread(self.exec_client.get_open_positions, self.symbol),
-                timeout=5.0
-            )
-            return any(abs(float(p.get("positionAmt", 0))) > 0 for p in positions)
-        except asyncio.TimeoutError:
-            logger.warning("[Trailing] ⚠️ Timeout checking position, assuming exists")
-            return True
-        except Exception as e:
-            logger.warning(f"[Trailing] ⚠️ Error checking position: {e}")
-            return True
-    
-    async def verify_position_closed(self, max_attempts: int = 3, delay: float = 2.0) -> bool:
-        """
-        Verify that position is really closed by checking multiple times.
-        Returns True only if position is confirmed closed after all checks.
-        Optimized to reduce API calls.
-        
-        Args:
-            max_attempts: Number of verification attempts (default: 3 to reduce API calls)
-            delay: Delay between attempts in seconds (default: 2.0 to reduce rate limit pressure)
-        """
-        logger.info(f"[Trailing] 🔍 Проверка реального закрытия позиции (попыток: {max_attempts}, задержка: {delay}с)...")
-        
-        positions_cache = None
-        for attempt in range(1, max_attempts + 1):
-            # Single API call - get positions once and use for both check and logging
-            try:
-                positions_cache = await asyncio.wait_for(
-                    asyncio.to_thread(self.exec_client.get_open_positions, self.symbol),
-                    timeout=5.0
-                )
-                has_pos = any(abs(float(p.get("positionAmt", 0))) > 0 for p in positions_cache)
-            except Exception as e:
-                logger.warning(f"[Trailing] ⚠️ Ошибка при проверке позиции: {e}")
-                # On error, assume position exists to be safe
-                has_pos = True
-                positions_cache = []
-            
-            # Log details only if position exists (to reduce log spam)
-            if has_pos and positions_cache:
-                pos_details = []
-                for p in positions_cache:
-                    pos_details.append(f"{p.get('symbol', 'N/A')}: {p.get('positionAmt', 0)} @ ${p.get('entryPrice', 0):.2f}")
-                logger.warning(f"[Trailing] ⚠️ Позиция всё ещё открыта (попытка {attempt}/{max_attempts}): {', '.join(pos_details)}")
-                if attempt < max_attempts:
-                    await asyncio.sleep(delay)
-                    continue
-                else:
-                    logger.error(f"[Trailing] ❌ Позиция не закрыта после {max_attempts} проверок!")
-                    return False
-            else:
-                logger.info(f"[Trailing] ✅ Позиция закрыта (попытка {attempt}/{max_attempts})")
-                if attempt < max_attempts:
-                    # Double-check after a delay
-                    await asyncio.sleep(delay)
-                    continue
-                else:
-                    logger.info(f"[Trailing] ✅ Позиция подтверждена закрытой после {max_attempts} проверок")
-                    return True
-        
-        # If we get here, all checks passed
-        return True
     
     async def get_latest_kline(self):
         """Fetch latest candle data"""
@@ -263,119 +197,12 @@ class TrailingStopManager:
             logger.warning(f"[Trailing] ⚠️ Error updating stop: {e}")
             return False
     
-    async def handle_position_closed(self):
-        """Handle position closure - cleanup and notify"""
-        logger.info("[Trailing] Обнаружено возможное закрытие позиции. Проверяем...")
-        
-        # Verify that position is really closed before cleaning up
-        # Reduced attempts and increased delay to reduce API calls
-        is_closed = await self.verify_position_closed(max_attempts=3, delay=2.0)
-        
-        if not is_closed:
-            logger.warning("[Trailing] ⚠️ Позиция не закрыта! Пропускаем очистку стопов и тейков.")
-            return
-        
-        # Skip additional check - verify_position_closed already did multiple checks
-        # This saves one API call
-        
-        logger.info("[Trailing] ✅ Позиция подтверждена закрытой. Очистка...")
-        
-        # Get exit price
-        exit_price = await self._get_exit_price()
-        
-        # Calculate PnL
-        if self.direction == "LONG":
-            pnl = (exit_price - self.entry_price) * self.position_qty
-        else:
-            pnl = (self.entry_price - exit_price) * self.position_qty
-        
-        # Determine reason
-        by_trailing = self.trailing_status_dict.get(self.symbol, False)
-        reason = "Trailing Stop" if by_trailing else ("Take Profit" if pnl > 0 else "Stop Loss")
-        
-        # Send notification
-        # Check if notification was already sent by PositionManager
-        notification_sent = False
-        if self.telegram_notifier:
-            if self.notification_sent_dict.get(self.symbol, False):
-                logger.info("[Trailing] ℹ️ Уведомление уже отправлено через PositionManager, пропускаем")
-                notification_sent = True
-            else:
-                # Skip additional check - verify_position_closed already verified multiple times
-                # This saves API calls
-                try:
-                    self.telegram_notifier.notify_position_closed(
-                        symbol=self.symbol,
-                        direction=self.direction,
-                        entry_price=self.entry_price,
-                        exit_price=exit_price,
-                        quantity=self.position_qty,
-                        pnl=pnl,
-                        by_trailing=by_trailing,
-                        reason=reason
-                    )
-                    self.notification_sent_dict[self.symbol] = True
-                    notification_sent = True
-                    logger.info(f"[Trailing] ✅ Notification sent (Exit: ${exit_price:.2f}, P&L: ${pnl:.2f})")
-                    
-                    # Skip post-notification check to save API calls
-                    # verify_position_closed already did thorough checking
-                except Exception as e:
-                    logger.warning(f"[Trailing] ⚠️ Failed to send notification: {e}")
-        
-        # Cleanup orders ONLY after all checks passed and notification sent (if needed)
-        # This ensures we don't remove protection orders if position is still open
-        # Skip final check to save API calls - verify_position_closed already verified
-        if notification_sent or not self.telegram_notifier:
-            try:
-                await asyncio.wait_for(
-                    asyncio.to_thread(self.exec_client.cancel_all_conditional_orders, self.symbol),
-                    timeout=5.0
-                )
-                logger.info("[Trailing] ✅ Условные ордера (стопы/тейки) удалены")
-            except Exception as e:
-                logger.warning(f"[Trailing] ⚠️ Error cancelling orders: {e}")
-        else:
-            logger.warning("[Trailing] ⚠️ Уведомление не отправлено, пропускаем удаление ордеров для безопасности")
-    
-    async def _get_exit_price(self) -> float:
-        """Get current price as exit price with caching"""
-        try:
-            price = await asyncio.wait_for(
-                asyncio.to_thread(self.exec_client.get_ticker_price, self.symbol, use_cache=True),
-                timeout=3.0
-            )
-            return price if price is not None else self.entry_price
-        except Exception as e:
-            logger.warning(f"[Trailing] ⚠️ Error getting exit price: {e}")
-            return self.entry_price
     
     async def run(self, update_interval: int = 15):
-        """Main trailing stop loop (default interval increased to reduce API calls)"""
+        """Main trailing stop loop - only updates stops, doesn't check for closure"""
         try:
-            consecutive_not_found = 0  # Track consecutive "position not found" checks
-            max_consecutive_not_found = 3  # Only treat as closed after 3 consecutive failures
-            
             while not self._stopped:
-                # Check if position exists (but don't immediately assume it's closed)
-                position_exists = await self.check_position_exists()
-                
-                if not position_exists:
-                    consecutive_not_found += 1
-                    # Only treat as closed after multiple consecutive failures
-                    # This prevents false positives during API delays or temporary issues
-                    if consecutive_not_found >= max_consecutive_not_found:
-                        logger.info(f"[Trailing] Позиция не найдена {consecutive_not_found} раз подряд, проверяем закрытие...")
-                        await self.handle_position_closed()
-                        break
-                    else:
-                        # Position not found, but might be temporary - continue with caution
-                        logger.debug(f"[Trailing] Позиция не найдена (попытка {consecutive_not_found}/{max_consecutive_not_found}), продолжаем...")
-                else:
-                    # Reset counter if position is found
-                    consecutive_not_found = 0
-                
-                # Get latest candle (with rate limiting)
+                # Get latest candle
                 candle = await self.get_latest_kline()
                 if not candle:
                     await asyncio.sleep(update_interval)
@@ -385,19 +212,17 @@ class TrailingStopManager:
                 low = float(candle[3])
                 close = float(candle[4])
                 
-                # Check activation (this just sets trailing_active flag, doesn't check position closure)
+                # Check activation (sets trailing_active flag and sends notification)
                 self.check_activation(high, low, close)
                 
-                # Calculate and update stop if needed
+                # Calculate and update stop if trailing is active
                 # When trailing activates, we just create a new stop at the new location
-                # No need to check if position is closed - it shouldn't be closed at activation
                 new_stop = self.calculate_new_stop(high, low)
                 if self.trailing_active:
                     # Update stop loss - this creates a new stop order at the new location
-                    # Position should still be open at this point
                     await self.update_stop_loss(new_stop, close)
                 
-            await asyncio.sleep(update_interval)
+                await asyncio.sleep(update_interval)
             
         except asyncio.CancelledError:
             logger.info("[Trailing] Stopped by cancellation")
