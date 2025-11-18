@@ -13,7 +13,7 @@ ACCUMULATION_PARAMS = {
 	"bb_position_high": 0.7,
 	"range_threshold": 0.3,  # quantile for range_pct
 	"sl_method": "low",
-	"rr_ratio": 5,
+	"rr_ratio": 2,
 	"lookback_bars_for_tp": 1000,
 	"volume_sma_window": 20,
 	"volume_window": 20,
